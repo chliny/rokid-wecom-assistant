@@ -13,7 +13,7 @@ import {
 import { maskUrl } from './qr-payload.js';
 import { silentLogger } from './log.js';
 
-export const CLIENT_INFO = { name: 'rokid-wecom-mcp', version: '1.0.0' };
+export const CLIENT_INFO = { name: 'rokid-wecom-assistant', version: '1.0.0' };
 export const DEFAULT_CONNECT_TIMEOUT_MS = 20000;
 export const DEFAULT_CALL_TIMEOUT_MS = 30000;
 

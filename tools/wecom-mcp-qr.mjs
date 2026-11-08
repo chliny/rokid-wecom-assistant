@@ -8,7 +8,7 @@
 //     --name 企业微信消息 --url 'https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=KEY'
 //
 // 二维码内容 = 共享协议模块（app/libs/qr-payload.js）定义的 payload：
-//   {"type":"rokid-wecom-mcp","version":1,"servers":[...]}
+//   {"type":"rokid-wecom-assistant","version":1,"servers":[...]}
 // 内容超出一个二维码容量时自动分片，逐张显示「请依次扫描 第 i/N 张」。
 // 终端输出只展示脱敏后的 URL / API Key；二维码图像里才是真实的配置。
 

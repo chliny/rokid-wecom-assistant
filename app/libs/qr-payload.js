@@ -8,21 +8,21 @@
 //
 // 完整配置（单个二维码装得下时）：
 //   {
-//     "type": "rokid-wecom-mcp",
+//     "type": "rokid-wecom-assistant",
 //     "version": 1,
 //     "servers": [{ "name": "企业微信消息", "url": "https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=..." }]
 //   }
 //
 // 分片配置（内容超出一个二维码容量时，连续扫描多张）：
 //   {
-//     "type": "rokid-wecom-mcp",
+//     "type": "rokid-wecom-assistant",
 //     "version": 1,
 //     "chunk": { "id": "3f2a91c0", "index": 0, "total": 3 },
 //     "checksum": "8f14e45f",          // 完整 payload 文本的 CRC32，用于重组校验
 //     "data": "{\"type\":\"rokid-we..." // 完整 payload 文本按码点切分的一段
 //   }
 
-export const QR_TYPE = 'rokid-wecom-mcp';
+export const QR_TYPE = 'rokid-wecom-assistant';
 export const QR_VERSION = 1;
 
 /** 协议限制：超出即拒绝，避免眼镜端被超长配置拖垮。 */

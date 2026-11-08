@@ -10,7 +10,7 @@
 // 不根据本地保存时间推算凭据是否过期；授权可用性以 MCP 服务端实际调用结果为准。
 import { ConfigError, maskUrl, validateServer } from './qr-payload.js';
 
-export const STORAGE_KEY = 'rokid-wecom-mcp:config:v1';
+export const STORAGE_KEY = 'rokid-wecom-assistant:config:v1';
 /**
  * @typedef {{name: string, url: string}} ServerConfig
  * @typedef {{servers: ServerConfig[], savedAt: number, mode: 'persistent'|'session'}} StoredConfig

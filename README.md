@@ -129,10 +129,10 @@ node tools/wecom-mcp-qr.mjs --no-interactive \
 ### 3. 安装到眼镜
 
 ```bash
-npm run pack                       # 产出 dist/wecom-mcp-assistant.aix
+npm run pack                       # 产出 dist/wecom-assistant.aix
 npx aix preview ./app              # 本机浏览器预览（无需真机）
-npx aix install dist/wecom-mcp-assistant.aix   # 通过 ADB 安装到眼镜
-npx aix launch-page dist/wecom-mcp-assistant.aix /pages/index/index
+npx aix install dist/wecom-assistant.aix   # 通过 ADB 安装到眼镜
+npx aix launch-page dist/wecom-assistant.aix /pages/index/index
 ```
 
 ### 4. 首次授权

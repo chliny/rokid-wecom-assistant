@@ -134,8 +134,8 @@ test('按字节上限分片：32 个长中文名配置的每一张二维码都�
 test('扫码分片字段严格校验：非法序号与非字符串内容必须拒绝', () => {
   // 摄像头扫到的内容是外部入口：非整数序号（"1x"/1.5）若被 parseInt 截断，
   // 会悄悄覆盖别的分片，最终 CRC 校验失败时才报错，用户只能重扫全部。
-  const makeScanned = (chunk, data = '{"type":"rokid-wecom-mcp","version":1,"servers":[]}') =>
-    JSON.stringify({ type: 'rokid-wecom-mcp', version: 1, chunk, checksum: 'deadbeef', data });
+  const makeScanned = (chunk, data = '{"type":"rokid-wecom-assistant","version":1,"servers":[]}') =>
+    JSON.stringify({ type: 'rokid-wecom-assistant', version: 1, chunk, checksum: 'deadbeef', data });
 
   const invalidChunks = [
     ['序号不是整数："1x"', { id: 'abcdef12', index: '1x', total: 3 }],
