@@ -1,0 +1,31 @@
+{
+  "name": "rokid-wecom-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Rokid AIUI 企业微信助手：AIUI 端应用 + 终端二维码配置工具",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "qr": "node tools/wecom-mcp-qr.mjs",
+    "build:libs": "node tools/build-libs.mjs",
+    "test": "node --test test/",
+    "mock:server": "node test/mock-mcp-server.mjs",
+    "preview": "aix preview ./app",
+    "pack": "mkdir -p dist && aix pack ./app -o dist/wecom-mcp-assistant.aix"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "^2.4.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/server": "^2.4.0",
+    "@yodaos-pkg/aix-cli": "^0.10.1",
+    "@yodaos-pkg/ink": "^0.19.1",
+    "esbuild": "^0.25.0",
+    "puppeteer-core": "^25.16.0",
+    "zod": "^4.6.7"
+  }
+}

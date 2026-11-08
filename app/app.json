@@ -1,0 +1,17 @@
+{
+  "name": "Rokid 企业微信助手",
+  "description": "通过企业微信官方远程 MCP，在眼镜上语音查询与操作企业微信的消息、日程、待办、文档等能力。",
+  "agentName": "Rokid 企业微信助手",
+  "agentDesc": "语音查询企业微信日程、待办、文档与会话；发送消息、删除内容等写操作会先与你确认。",
+  "pages": [
+    "pages/index/index",
+    "pages/scan/index",
+    "pages/tools/index"
+  ],
+  "permissions": ["CAMERA", "RECORD_AUDIO"],
+  "window": {
+    "navigationBarTitleText": "企业微信助手",
+    "navigationBarTextStyle": "light",
+    "navigationBarBackgroundColor": "#000000"
+  }
+}

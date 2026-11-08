@@ -1,0 +1,28 @@
+node_modules/
+dist/
+*.aix
+# 终端二维码导出物（含真实凭据，务必不要提交）
+*.qr.png
+*.qr.svg
+qr*.png
+qr*.svg
+qr-export/
+# README 里文档化的导出名（--png out.png / --svg out.svg / 多张 out-1.png…）
+out.png
+out.svg
+out-*.png
+out-*.svg
+# 导出进程被中断/写入失败时可能残留的同目录临时文件，同样含真实凭据
+*.png.tmp-*
+*.svg.tmp-*
+# 导出并发锁（进程被强杀时可能残留，按错误提示手动处理）
+.qr-export-*.lock
+# 批量 MCP 配置文件可能包含多个真实 Token
+wecom-mcps*.json
+wecom-mcps*.txt
+
+.refs/
+# 本地维护的 docs/（截图与验证记录）不随仓库提交
+docs/
+# 仅忽略仓库根目录的 AGENTS.md；app/AGENTS.md 是 AIUI 工程文件，需要入库
+/AGENTS.md

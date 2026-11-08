@@ -1,0 +1,10 @@
+{
+  "name": "rokid-wecom-mcp-assistant",
+  "version": "1.0.0",
+  "description": "Rokid AIUI 企业微信助手（AIUI 应用工程）",
+  "type": "module",
+  "main": "app.js",
+  "private": true,
+  "license": "MIT",
+  "dependencies": {}
+}
