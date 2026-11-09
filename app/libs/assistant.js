@@ -59,6 +59,9 @@ const CONFIRM_TIMEOUT_MS = 120000;
 /** 连接失败后的重试冷却（毫秒）：冷却期内直接复用上次失败结果，避免每次问话都等满超时。 */
 const CONNECT_RETRY_COOLDOWN_MS = 10000;
 
+/** 模型可用性、创建会话与生成结果共用的等待上限。 */
+const MODEL_TIMEOUT_MS = 15000;
+
 /** 「查看工具」这类元指令。 */
 const LIST_INTENT_PATTERN = /(有哪些|有什么|查看|看看|列出|显示).{0,6}(工具|功能|能力)|能做什么|可以做什么/;
 
@@ -418,9 +421,43 @@ export class Assistant {
     const languageModel = this.languageModel;
     if (!languageModel || typeof languageModel.availability !== 'function') return null;
 
+    // 整个模型选择阶段共用同一截止时间，避免三个阶段各等满一次。
+    const deadline = Date.now() + MODEL_TIMEOUT_MS;
+    const awaitModel = (operation) => new Promise((resolve, reject) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        reject(new Error('LanguageModel 响应超时'));
+        return;
+      }
+      const timer = setTimeout(() => reject(new Error('LanguageModel 响应超时')), remaining);
+      try {
+        // 启动前检查预算；即使超时先发生，也继续消费操作迟到的拒绝。
+        Promise.resolve(operation()).then(
+          (value) => {
+            clearTimeout(timer);
+            // 同步宿主调用可能阻塞事件循环，完成回调会先于超时定时器执行。
+            if (Date.now() >= deadline) reject(new Error('LanguageModel 响应超时'));
+            else resolve(value);
+          },
+          (error) => { clearTimeout(timer); reject(error); },
+        );
+      } catch (error) {
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
+    const destroySession = (session) => {
+      try {
+        // destroy 通常同步；若宿主返回 Promise，不等待它，也要处理迟到的拒绝。
+        Promise.resolve(session?.destroy?.()).catch(() => {});
+      } catch {
+        // 清理失败不阻塞降级。
+      }
+    };
+
     let availability;
     try {
-      availability = await languageModel.availability();
+      availability = await awaitModel(() => languageModel.availability());
     } catch (error) {
       this.logger.warn('LanguageModel.availability 失败，改用规则匹配', error);
       return null;
@@ -454,20 +491,27 @@ export class Assistant {
     }
 
     let session;
+    let creating;
     try {
-      session = await languageModel.create({
-        initialPrompts: [{ role: 'system', content: this._systemPrompt() }],
-        tools: modelToolsSafe,
+      session = await awaitModel(() => {
+        creating = Promise.resolve(languageModel.create({
+          initialPrompts: [{ role: 'system', content: this._systemPrompt() }],
+          tools: modelToolsSafe,
+        }));
+        return creating;
       });
     } catch (error) {
+      // create 可能在超时之后才成功，不能泄漏那个迟到的会话，也不能继续 prompt。
+      creating?.then(destroySession, () => {});
       this.logger.warn('LanguageModel.create 失败，改用规则匹配', error);
       return null;
     }
 
     /** @type {Array<{functionName: string, arguments: any}>} */
     const toolCalls = [];
+    let acceptingToolCalls = true;
     const onToolCall = (event) => {
-      if (!event || typeof event.functionName !== 'string') return;
+      if (!acceptingToolCalls || !event || typeof event.functionName !== 'string') return;
       // 契约：arguments 是已解析对象；JSON 非法时为原始字符串，空时为 null
       let args = event.arguments ?? {};
       if (typeof args === 'string') {
@@ -484,18 +528,19 @@ export class Assistant {
     let reply;
     try {
       session.addEventListener?.('toolcall', onToolCall);
-      reply = await session.prompt(utterance);
+      reply = await awaitModel(() => session.prompt(utterance));
     } catch (error) {
       // 只有「模型调用失败」才回退到规则匹配；工具执行失败必须向上抛（见下面单独调用）。
       this.logger.warn('LanguageModel 调用失败，改用规则匹配', error);
       return null;
     } finally {
+      acceptingToolCalls = false;
       try {
         session.removeEventListener?.('toolcall', onToolCall);
-        session.destroy?.();
       } catch {
-        // 忽略 session 清理失败
+        // 监听器解绑失败也必须尝试销毁会话。
       }
+      destroySession(session);
     }
     if (toolCalls.length === 0) {
       const text = typeof reply === 'string' && reply.trim() ? reply.trim() : '我没有找到对应的工具。';

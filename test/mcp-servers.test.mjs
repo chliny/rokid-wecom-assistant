@@ -5,6 +5,7 @@
 // 这正是本项目最关键的业务风险：**连接成功 ≠ 授权可用**，必须用只读工具实调探测。
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import { startMockWecomMcp } from './mock-mcp-server.mjs';
 import { McpServers } from '../app/libs/mcp-servers.js';
 
@@ -147,6 +148,50 @@ test('能力位全部未授权时，探测上报 capability-unauthorized 而不�
   }
 });
 
+test('探针空参被业务校验拒绝且其他候选未授权时，不得声称授权有效', async () => {
+  // schema 未标记必填，但通讯录工具实际要求 keywords；业务错误并不能证明授权有效。
+  // 其余候选未授权时，探测只能报告未能验证，不能把它当成成功或全部能力未授权。
+  const probeRejects = await startMockWecomMcp({
+    apikey: APIKEY,
+    unauthorizedTools: ['message_aibot_sessions_list', 'calendar_schedules_list', 'todo_list'],
+  });
+  const servers = createServers(probeRejects.url);
+  try {
+    await servers.connectAll();
+    const [verify] = await servers.verifyAuthorizationAll();
+    assert.equal(verify.verified, false, '业务错误不能证明授权有效');
+    assert.equal(verify.reason, 'probe-failed');
+    assert.equal(verify.toolName, 'contact_users_search');
+    assert.equal(verify.error?.code, 'TOOL');
+    assert.equal(probeRejects.calls.contact_users_search, 1, '探针只应空参调用一次');
+  } finally {
+    await servers.closeAll();
+    await probeRejects.close();
+  }
+});
+
+test('授权探针遇到未知业务错误时尝试其他候选，成功后才确认授权', async () => {
+  const fetchWithBusinessFailure = async (input, init) => {
+    const rpc = init?.body ? JSON.parse(init.body) : null;
+    if (rpc?.method === 'tools/call' && rpc.params?.name === 'message_aibot_sessions_list') {
+      return new Response(JSON.stringify({
+        jsonrpc: '2.0', id: rpc.id,
+        result: { content: [{ type: 'text', text: JSON.stringify({ errcode: 999999, errmsg: 'temporary failure' }) }] },
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    return fetch(input, init);
+  };
+  const servers = createServers(mock.url, { fetchImpl: fetchWithBusinessFailure });
+  try {
+    await servers.connectAll();
+    const [verify] = await servers.verifyAuthorizationAll();
+    assert.equal(verify.verified, true);
+    assert.equal(verify.toolName, 'calendar_schedules_list', '不得把前一个业务错误当作成功');
+  } finally {
+    await servers.closeAll();
+  }
+});
+
 test('写操作超时后绝不重连重放：服务端只执行一次', async () => {
   // 真实事故场景：请求超时但服务端其实已经执行成功，若自动重试，用户会收到两条相同的消息。
   const slowWrite = await startMockWecomMcp({ apikey: APIKEY, toolLatencyMs: 800 });
@@ -193,6 +238,27 @@ test('只读工具超时仍然重连重试一次（不受写操作修复影响�
   }
 });
 
+test('取消授权探测后不重放在途的只读请求', async () => {
+  const slow = await startMockWecomMcp({ apikey: APIKEY, toolLatencyMs: 800 });
+  const servers = createServers(slow.url);
+  const controller = new AbortController();
+  try {
+    await servers.connectAll();
+    const pending = servers.connections[0].verifyAuthorization({
+      timeoutMs: 5000, signal: controller.signal, retry: false,
+    });
+    await waitFor(() => (slow.calls.message_aibot_sessions_list ?? 0) > 0, '授权探针应已到达服务端');
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.verified, false, '取消后不能把迟到结果当成验证成功');
+    await delay(900);
+    assert.equal(slow.calls.message_aibot_sessions_list, 1, '取消后不能重放请求');
+  } finally {
+    await servers.closeAll();
+    await slow.close();
+  }
+});
+
 test('网络响应过慢时按超时上报，不误报成授权失败', async () => {
   const slow = await startMockWecomMcp({ apikey: APIKEY, latencyMs: 700 });
   const servers = createServers(slow.url, { timeoutMs: 250, callTimeoutMs: 250 });
@@ -204,6 +270,75 @@ test('网络响应过慢时按超时上报，不误报成授权失败', async ()
   } finally {
     await servers.closeAll();
     await slow.close();
+  }
+});
+
+test('宿主层请求超时按超时上报，不把英文原文丢给用户、不诱导重新扫码', async () => {
+  // 宿主超时不是 SDK 的 REQUEST_TIMEOUT（会被包进版本协商等错误里），
+  // 若按「协议错误」归类，扫码页会显示 `request timeout (5000ms)` 这类英文原文。
+  const timeoutFetch = () => Promise.reject(new Error('request timeout (5000ms)'));
+  const servers = new McpServers([{ name: '企业微信消息', url: mock.url }], {
+    timeoutMs: 8000,
+    callTimeoutMs: 8000,
+    fetchImpl: timeoutFetch,
+  });
+  try {
+    const results = await servers.connectAll();
+    assert.equal(results[0].ok, false);
+    assert.equal(results[0].error?.code, 'TIMEOUT');
+    assert.doesNotMatch(results[0].error?.message ?? '', /request timeout/i, '不应把运行时英文原文展示给用户');
+    assert.notEqual(results[0].error?.needRescan, true, '超时不应诱导用户重新授权');
+  } finally {
+    await servers.closeAll();
+  }
+});
+
+test('初始化通知响应过慢时，整个连接握手按配置超时', async () => {
+  let notificationStarted = false;
+  const slowFetch = async (input, init) => {
+    const method = init?.body ? JSON.parse(init.body).method : '';
+    if (method === 'notifications/initialized') {
+      notificationStarted = true;
+      await delay(4000, undefined, { signal: init.signal });
+    }
+    return fetch(input, init);
+  };
+  const servers = createServers(mock.url, { timeoutMs: 2000, fetchImpl: slowFetch });
+  try {
+    const results = await servers.connectAll();
+    assert.equal(notificationStarted, true, '应先完成 initialize，再进入初始化通知');
+    assert.equal(results[0].ok, false);
+    assert.equal(results[0].error?.code, 'TIMEOUT');
+  } finally {
+    await servers.closeAll();
+  }
+});
+
+test('工具列表响应过慢时，连接按配置超时并取消请求', async () => {
+  let listStarted = false;
+  let listAborted = false;
+  const slowFetch = async (input, init) => {
+    const method = init?.body ? JSON.parse(init.body).method : '';
+    if (method === 'tools/list') {
+      listStarted = true;
+      try {
+        await delay(1500, undefined, { signal: init.signal });
+      } catch (error) {
+        listAborted = true;
+        throw error;
+      }
+    }
+    return fetch(input, init);
+  };
+  const servers = createServers(mock.url, { timeoutMs: 500, fetchImpl: slowFetch });
+  try {
+    const results = await servers.connectAll();
+    assert.equal(listStarted, true, '应先完成握手，再进入工具列表请求');
+    assert.equal(results[0].ok, false);
+    assert.equal(results[0].error?.code, 'TIMEOUT');
+    assert.equal(listAborted, true, '超时应取消在途工具列表请求');
+  } finally {
+    await servers.closeAll();
   }
 });
 

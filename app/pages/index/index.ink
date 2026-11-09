@@ -31,7 +31,7 @@ const MENU_ITEMS = [
   { id: 'exit', label: '退出助手' },
 ];
 
-const KEY_HANDLED = ['Enter', 'Backspace', 'ArrowUp', 'ArrowDown', 'GlobalHook'];
+const KEY_HANDLED = ['Enter', 'Backspace', 'ArrowUp', 'ArrowDown'];
 
 export default {
   data: {
@@ -218,15 +218,17 @@ export default {
   onKeyDown(event) {
     const code = event?.code;
     if (!KEY_HANDLED.includes(code)) return;
-    if (code === 'Enter' || code === 'GlobalHook') this.handleEnter();
+    if (code === 'Enter') this.handleEnter();
     else if (code === 'Backspace') this.handleBack();
     else if (code === 'ArrowUp') this.moveCursor(-1);
     else if (code === 'ArrowDown') this.moveCursor(1);
   },
 
   onKeyUp(event) {
+    const code = event?.code;
+    if (!KEY_HANDLED.includes(code)) return;
     // 页面自己接管默认行为（返回/确认/方向），避免叠加宿主默认动作
-    if (KEY_HANDLED.includes(event?.code)) event.preventDefault?.();
+    event.preventDefault?.();
   },
 
   onVoiceWakeup(event) {
@@ -263,6 +265,7 @@ export default {
   },
 
   handleBack() {
+    if (this.exiting) return;
     const view = this.data.view;
     if (view === 'listening') {
       this.voice?.abort?.();
@@ -313,7 +316,7 @@ export default {
   hintFor(view, action) {
     switch (view) {
       case 'no-config':
-        return '确认键扫码授权 · 返回键打开菜单';
+        return '确认键扫码授权 · 返回键菜单';
       case 'ready':
         return '确认键说话 · 返回键菜单';
       case 'answer':
@@ -883,9 +886,12 @@ export default {
 
   /** 退出助手：先释放 MCP 连接与语音资源，再退出小程序。 */
   async exitAssistant() {
+    if (this.exiting) return;
+    this.exiting = true;
     this.setView('thinking', '正在退出…');
     try {
-      await disposeSession();
+      // 清理最多等 1.5s：设备上关闭 MCP 连接偶尔会拖住，不能因此卡在「正在退出…」
+      await Promise.race([disposeSession(), new Promise((resolve) => setTimeout(resolve, 1500))]);
     } catch {
       // 退出前的清理失败不阻塞退出
     }

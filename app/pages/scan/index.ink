@@ -9,31 +9,20 @@
 <script setup>
 import wx from 'wx';
 import { createQrDetector, scanOnce } from '../../libs/scanner.js';
-import { createChunkAssembler, parseScannedText, validatePayload, ConfigError } from '../../libs/qr-payload.js';
+import {
+  createChunkAssembler,
+  parseScannedText,
+  validatePayload,
+  ConfigError,
+} from '../../libs/qr-payload.js';
 import { setScanResult, probeServers } from '../../libs/session.js';
 import { formatError } from '../../libs/format.js';
 
-// 探测最多 32 个 MCP 配置：连接并发 15s + 验证按 4 并发分批，给一个上界兜底，
-// 避免页面永远停在 PROBING（超过该上限提示重试，用户也可按返回键退出）。
+// 每轮探测的总预算，包含所有连接和授权探针。
 const PROBE_TIMEOUT_MS = 150000;
 
-/** 给可能永不返回的异步操作加超时（用于连接验证这类不可取消的长流程）。 */
-function withTimeout(promise, ms, message) {
-  if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve(promise);
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
-    Promise.resolve(promise).then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
+/** 页面接管的按键（keyup 时拦截宿主默认动作，避免与页面逻辑双重触发）。 */
+const KEY_HANDLED = ['Enter', 'Backspace', 'ArrowUp', 'ArrowDown'];
 
 export default {
   data: {
@@ -102,6 +91,10 @@ export default {
 
   /** 进入下一代：页面上所有在途异步流程的旧 generation 立即失效。 */
   nextGeneration() {
+    this.probeController?.abort();
+    this.probeController = null;
+    this.probeCache = null;
+    this.retryPayload = null;
     this.generation = (this.generation ?? 0) + 1;
     return this.generation;
   },
@@ -126,11 +119,11 @@ export default {
       });
       return;
     }
-    // 保存过程中被系统打断（页面回到前台但配置没有回传）：回到可重扫状态，避免按键全部失效
-    if (status === 'CONFIRM' && (this.data.saving || !this.data.pendingPayload)) {
+    // 授权确认页离开前台后结果可能已过期；回到前台必须重新扫码并验证。
+    if (status === 'CONFIRM') {
       this.setData({
         status: 'READY',
-        message: '保存未完成，请重新扫描',
+        message: '页面已离开，请重新扫码验证',
         detail: '将二维码对准镜头，按确认键扫描',
         isScanning: false,
         saving: false,
@@ -142,46 +135,65 @@ export default {
 
   onKeyDown(event) {
     const code = event?.code;
-    const status = this.data.status;
-    if (status === 'CONFIRM') {
-      // 保存已触发（已回传配置并 navigateBack）：忽略所有按键，避免取消/切换撤销已发生的保存
-      if (this.data.saving) return;
-      if (code === 'Enter' || code === 'GlobalHook') {
-        this.saveAndReturn();
-        return;
-      }
-      if (code === 'Backspace') {
-        this.cancelConfirm();
-        return;
-      }
-      if (code === 'ArrowUp' || code === 'ArrowDown') {
-        this.setData({ persist: !this.data.persist });
-        return;
-      }
-      return;
-    }
-    // SCANNING / PROBING 期间不响应确认键：避免重复触发扫码或与在途探测竞争；
-    // 但必须允许返回键退出，否则在途回调丢失（页面隐藏/卡住）时页面会永久无响应。
-    if (status !== 'READY' && status !== 'ERROR') {
-      if (code === 'Backspace') {
-        this.nextGeneration();
-        wx.navigateBack({ delta: 1 });
-      }
+    if (code === 'Enter') {
+      this.runConfirmTap();
       return;
     }
     if (code === 'Backspace') {
-      wx.navigateBack({ delta: 1 });
+      this.handleBack();
       return;
     }
-    if (code === 'Enter' || code === 'GlobalHook') {
-      this.captureAndScan();
+    if ((code === 'ArrowUp' || code === 'ArrowDown') && this.data.status === 'CONFIRM') {
+      if (this.data.saving) return;
+      this.setData({ persist: !this.data.persist });
     }
   },
 
   onKeyUp(event) {
-    if (['Enter', 'Backspace', 'GlobalHook', 'ArrowUp', 'ArrowDown'].includes(event?.code)) {
-      event.preventDefault?.();
+    const code = event?.code;
+    if (!KEY_HANDLED.includes(code)) return;
+    event.preventDefault?.();
+  },
+
+  /** 单击确认：按当前状态执行保存 / 扫描（SCANNING、PROBING 期间忽略，避免重复触发）。 */
+  runConfirmTap() {
+    const status = this.data.status;
+    if (status === 'CONFIRM') {
+      // 保存已触发（已回传配置并 navigateBack）：忽略，避免撤销已发生的保存
+      if (this.data.saving) return;
+      this.saveAndReturn();
+      return;
     }
+    if (status !== 'READY' && status !== 'ERROR') return;
+    if (status === 'ERROR' && this.retryPayload) {
+      this.probeAndConfirm(this.retryPayload);
+      return;
+    }
+    this.captureAndScan();
+  },
+
+  /** 返回键：确认页里是取消保存，其余状态直接退出扫码页。 */
+  handleBack() {
+    if (this.data.status === 'CONFIRM') {
+      if (this.data.saving) return;
+      this.cancelConfirm();
+      return;
+    }
+    this.exitScanPage();
+  },
+
+  /**
+   * 退出扫码页并回到主界面。直接以扫码页启动（无上一页）时 navigateBack 会失败，
+   * 回退到退出小程序，避免返回之后页面毫无反应。
+   */
+  exitScanPage() {
+    this.nextGeneration();
+    wx.navigateBack({
+      delta: 1,
+      fail: () => {
+        wx.exitMiniProgram?.();
+      },
+    });
   },
 
   async captureAndScan() {
@@ -273,6 +285,7 @@ export default {
   },
 
   finishWithPayload(payload) {
+    // parseScannedText 已把 v4 紧凑载荷（能力位 + key 打包 + base44）解包成完整 URL / 名称，这里只做协议校验。
     let validated;
     try {
       validated = validatePayload(payload);
@@ -280,10 +293,13 @@ export default {
       this.showConfigError(error);
       return;
     }
+    // 新扫描配置不能复用上一次的任何授权结果。
+    this.probeCache = null;
+    this.retryPayload = null;
     this.probeAndConfirm(validated);
   },
 
-  /** 最多展示 3 个 server 名，避免 352px 屏幕被 32 个长名称撑破。 */
+  /** 最多展示 3 个 server 名，避免 352px 屏幕被长名称撑破。 */
   formatServerNames(servers) {
     const names = servers.map((server) => server.name);
     const shown = names.slice(0, 3).join('、');
@@ -305,34 +321,38 @@ export default {
       warning: '',
       pendingPayload: validated,
     });
+    const controller = new AbortController();
+    this.probeController = controller;
     let probe;
     try {
-      probe = await withTimeout(
-        probeServers(validated.servers),
-        PROBE_TIMEOUT_MS,
-        '验证授权超时（网络较慢或 MCP 无响应），请按确认键重试',
-      );
+      probe = await probeServers(validated.servers, {
+        timeoutMs: PROBE_TIMEOUT_MS,
+        signal: controller.signal,
+        cache: this.probeCache,
+      });
     } catch (error) {
       if (!this.isGenerationCurrent(generation)) return;
-      this.updateData({
-        status: 'ERROR',
-        message: '验证授权失败',
-        detail: formatError(error),
-        pendingPayload: null,
-      });
+      this.retryPayload = validated;
+      this.updateData({ status: 'ERROR', message: '验证授权失败', detail: formatError(error), pendingPayload: null });
       return;
+    } finally {
+      if (this.probeController === controller) this.probeController = null;
     }
-    // 页面隐藏/被新流程顶掉（例如返回键退出）后，探测结果直接丢弃
     if (!this.isGenerationCurrent(generation)) return;
+    this.probeCache = probe.cache;
     if (!probe.ok) {
+      this.retryPayload = probe.authFailed ? null : validated;
       this.updateData({
         status: 'ERROR',
-        message: probe.authFailed ? '授权无效或已过期' : '无法连接该 MCP',
-        detail: formatError(probe.error ?? { message: '请检查网络后重试' }),
+        message: probe.authFailed ? '授权无效或已过期' : '部分 MCP 未连接',
+        detail: probe.authFailed
+          ? formatError(probe.error ?? { message: '请重新扫码授权' })
+          : `已完成 ${probe.completedCount}/${probe.totalCount}，确认键重试失败项`,
         pendingPayload: null,
       });
       return;
     }
+    this.retryPayload = null;
     const names = probe.tools.map((tool) => tool.name);
     const shown = names.slice(0, 3).join('、');
     const warnings = Array.isArray(probe.warnings) ? probe.warnings.filter(Boolean) : [];

@@ -6,28 +6,41 @@
 //   - 单元测试：test/qr-payload.test.mjs
 // 使用，保证「生成」与「解析」永远是同一份协议定义。
 //
-// 完整配置（单个二维码装得下时）：
-//   {
-//     "type": "rokid-wecom-assistant",
-//     "version": 1,
-//     "servers": [{ "name": "企业微信消息", "url": "https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=..." }]
-//   }
+// 完整配置（v4 紧凑载荷；应用尚未发布，不保留旧格式）：
+//   文本 = "RWA4" + base44(二进制载荷)，全部是 QR 字母数字字符（0-9 A-Z $ % * + - . / :），
+//   QR 因此可以走 alphanumeric 模式（每字符 5.5 bit，比 byte 模式省 30%+）。
+//   固定 8 个能力位的 name / url 映射固化在代码里（app/libs/wecom-mcp.js），二维码只保存
+//   「哪些能力位在用 + 每把 API Key」：
+//     [能力位位图(1B)][key 公共前缀长度(2B)][key 长度(2B, 0xFFFF=逐项)]
+//     [key 公共前缀 + 各 key 去掉前缀后的 base64url 字符，按 6 bit 打包]
+//   8 个能力位实测约 282 字符（v3 为 345 字符），QR 由 v11/63×32 降到 v10/59×30。
 //
-// 分片配置（内容超出一个二维码容量时，连续扫描多张）：
+// 分片配置（内容超出一个二维码容量时，连续扫描多张；信封是 JSON，版本同为 v4）：
 //   {
 //     "type": "rokid-wecom-assistant",
-//     "version": 1,
+//     "version": 2,
 //     "chunk": { "id": "3f2a91c0", "index": 0, "total": 3 },
-//     "checksum": "8f14e45f",          // 完整 payload 文本的 CRC32，用于重组校验
-//     "data": "{\"type\":\"rokid-we..." // 完整 payload 文本按码点切分的一段
+//     "checksum": "8f14e45f",          // 完整配置文本的 CRC32，用于重组校验
+//     "data": "{\"type\":\"rokid-we..." // 完整配置文本按码点切分的一段
 //   }
 
+import {
+  CAPABILITIES,
+  WECOM_APIKEY_INVALID_CHARS,
+  WECOM_APIKEY_MAX_LENGTH,
+  WECOM_APIKEY_PARAM,
+  WECOM_MCP_ORIGIN,
+  WECOM_MCP_PATH_PREFIX,
+  displayNameForCapability,
+} from './wecom-mcp.js';
+
 export const QR_TYPE = 'rokid-wecom-assistant';
-export const QR_VERSION = 1;
+export const QR_VERSION = 4;
 
 /** 协议限制：超出即拒绝，避免眼镜端被超长配置拖垮。 */
 export const LIMITS = {
-  maxServers: 32,
+  // 二维码里的连接 = 8 个固定能力位（每个能力位一把 API Key），所以上限与能力位数量一致
+  maxServers: 8,
   maxNameLength: 40,
   maxUrlLength: 2048,
   maxPayloadChars: 81920,
@@ -58,6 +71,7 @@ export class ConfigError extends Error {
 // ---------------------------------------------------------------- CRC32
 
 const UTF8_ENCODER = new TextEncoder();
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 /**
  * 计算字符串的 UTF-8 字节数：这才是二维码实际占用的容量单位（中文 3 字节/字）。
@@ -283,11 +297,23 @@ export function validatePayload(raw, options = {}) {
 
   const servers = record.servers.map((server, index) => validateServer(server, index, options));
   const seen = new Set();
+  const seenCapabilities = new Set();
   for (const server of servers) {
     if (seen.has(server.url)) {
       throw new ConfigError('DUPLICATE_SERVER', `存在重复的 MCP：${server.name}`);
     }
     seen.add(server.url);
+    // 能力位是固定集合，二维码按「能力位 -> 一把 API Key」存储，同一能力位不能配多把 key
+    const capabilityId = officialCapabilityId(server.url);
+    if (capabilityId) {
+      if (seenCapabilities.has(capabilityId)) {
+        throw new ConfigError(
+          'DUPLICATE_CAPABILITY',
+          `能力位「${capabilityId}」只能配置一把 API Key，请检查是否重复添加了同一能力位`,
+        );
+      }
+      seenCapabilities.add(capabilityId);
+    }
   }
   return { type: QR_TYPE, version: QR_VERSION, servers };
 }
@@ -305,17 +331,372 @@ export function buildPayload(servers) {
   };
 }
 
+// ---------------------------------------------------------------- 紧凑载荷（v4）
+
+/** v4 载荷的起始标记（QR 字母数字字符，便于快速识别）。 */
+const PAYLOAD_MARKER = 'RWA4';
+const PAYLOAD_FORMAT_VERSION = 4;
+
+/** base64url 字母表：API Key 字符集，每字符 6 bit（打包进二进制载荷时用）。 */
+const BASE64URL_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+const BASE64URL_INDEX = new Map([...BASE64URL_CHARS].map((ch, index) => [ch, index]));
+
 /**
- * 序列化为二维码承载的文本（字段顺序固定，便于人工比对与测试）。
- * @param {{type?: string, version?: number, servers: Array<{name: string, url: string}>}} payload
+ * 传输字母表：QR 字母数字字符集去掉空格后的 44 个字符。
+ * 不含小写字母/空格，二维码才会走 alphanumeric 模式，且首尾不会被扫描结果 trim 破坏。
+ */
+const BASE44_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$%*+-./:';
+const BASE44_INDEX = new Map([...BASE44_CHARS].map((ch, index) => [ch, index]));
+
+/** 官方路径 /mcp/v<版本>/bot/<能力位> */
+const OFFICIAL_PATH_PATTERN = /^\/mcp\/v\d+\/bot\/([A-Za-z0-9_-]+)\/?$/;
+
+/**
+ * 从 URL 取出官方能力位代号；非官方路径（或无法无损重建）返回 null。
+ * @param {string} rawUrl
+ * @returns {string | null}
+ */
+function officialCapabilityId(rawUrl) {
+  const info = parseOfficialServerUrl(rawUrl);
+  return info ? info.capabilityId : null;
+}
+
+/**
+ * 计算多个字符串的最长公共前缀。
+ * @param {string[]} values
+ * @returns {string}
+ */
+function longestCommonPrefix(values) {
+  if (!values.length) return '';
+  let prefix = values[0];
+  for (const value of values.slice(1)) {
+    let index = 0;
+    while (index < prefix.length && index < value.length && prefix[index] === value[index]) index += 1;
+    prefix = prefix.slice(0, index);
+    if (!prefix) break;
+  }
+  return prefix;
+}
+
+/**
+ * 判断 URL 能否无损压缩成「能力位 + API Key」：
+ * 官方 https 地址、只有 apikey 一个查询参数，且用相同规则重建后与原 URL 逐字一致。
+ * @param {string} rawUrl
+ * @param {boolean} [forEncoding] 编码时明确报告无法支持的 Key 字符
+ * @returns {{capabilityId: string, apiKey: string} | null}
+ */
+function parseOfficialServerUrl(rawUrl, forEncoding = false) {
+  let url;
+  try {
+    url = new URL(String(rawUrl ?? '').trim());
+  } catch {
+    return null;
+  }
+  const match = OFFICIAL_PATH_PATTERN.exec(url.pathname);
+  if (!match) return null;
+  if (url.origin !== WECOM_MCP_ORIGIN) return null;
+  if (url.username || url.password || url.port || url.hash) return null;
+  const params = [...url.searchParams.keys()];
+  if (params.length !== 1 || params[0] !== WECOM_APIKEY_PARAM) return null;
+  const apiKey = url.searchParams.get(WECOM_APIKEY_PARAM) ?? '';
+  if (!apiKey) return null;
+  if (forEncoding && WECOM_APIKEY_INVALID_CHARS.test(apiKey)) {
+    throw new ConfigError('INVALID_API_KEY', 'API Key 格式不正确：仅支持英文字母、数字、- 和 _（base64url）');
+  }
+  const rebuilt = buildOfficialUrl(match[1], apiKey);
+  if (rebuilt !== url.toString()) return null;
+  return { capabilityId: match[1], apiKey };
+}
+
+/**
+ * 按官方格式组装 URL。
+ * @param {string} capabilityId
+ * @param {string} apiKey
+ * @returns {string}
+ */
+function buildOfficialUrl(capabilityId, apiKey) {
+  const url = new URL(`${WECOM_MCP_PATH_PREFIX}${capabilityId}`, WECOM_MCP_ORIGIN);
+  url.searchParams.set(WECOM_APIKEY_PARAM, apiKey);
+  return url.toString();
+}
+
+/**
+ * 把 6 bit 符号序列打包成字节（高位在前，末尾补 0）。
+ * @param {number[]} symbols
+ * @returns {number[]}
+ */
+function packSymbols(symbols) {
+  const bytes = [];
+  let acc = 0;
+  let bits = 0;
+  for (const value of symbols) {
+    acc = (acc << 6) | value;
+    bits += 6;
+    while (bits >= 8) {
+      bits -= 8;
+      bytes.push((acc >> bits) & 0xff);
+    }
+  }
+  if (bits > 0) bytes.push((acc << (8 - bits)) & 0xff);
+  return bytes;
+}
+
+/**
+ * 从字节流解出指定数量的 6 bit 符号；不足时抛配置错误（扫描不完整）。
+ * @param {Uint8Array} bytes
+ * @param {number} count
+ * @returns {number[]}
+ */
+function unpackSymbols(bytes, count) {
+  const symbols = [];
+  let acc = 0;
+  let bits = 0;
+  let offset = 0;
+  while (symbols.length < count) {
+    while (bits < 6) {
+      if (offset >= bytes.length) {
+        throw new ConfigError('INVALID_PAYLOAD', '二维码载荷不完整（可能扫描不完整），请重新扫描');
+      }
+      acc = (acc << 8) | bytes[offset];
+      offset += 1;
+      bits += 8;
+    }
+    bits -= 6;
+    symbols.push((acc >> bits) & 0x3f);
+  }
+  return symbols;
+}
+
+/**
+ * base44 编码：每 2 字节 → 3 字符（1 字节 → 2 字符），全部落在 QR 字母数字字符集内。
+ * @param {Uint8Array | number[]} input
+ * @returns {string}
+ */
+function base44Encode(input) {
+  const bytes = input;
+  let out = '';
+  let index = 0;
+  for (; index + 1 < bytes.length; index += 2) {
+    let value = bytes[index] * 256 + bytes[index + 1];
+    out += BASE44_CHARS[value % 44];
+    value = Math.floor(value / 44);
+    out += BASE44_CHARS[value % 44];
+    out += BASE44_CHARS[Math.floor(value / 44)];
+  }
+  if (index < bytes.length) {
+    const value = bytes[index];
+    out += BASE44_CHARS[value % 44] + BASE44_CHARS[Math.floor(value / 44)];
+  }
+  return out;
+}
+
+/**
+ * base44 解码：非法字符 / 非法长度 / 数值越界都报配置错误。
+ * @param {string} text
+ * @returns {Uint8Array}
+ */
+function base44Decode(text) {
+  const value = String(text ?? '');
+  if (!value) throw new ConfigError('INVALID_PAYLOAD', '二维码载荷为空');
+  if (value.length % 3 === 1) {
+    throw new ConfigError('INVALID_PAYLOAD', '二维码载荷长度不合法（可能扫描不完整）');
+  }
+  const bytes = [];
+  for (let index = 0; index < value.length; index += 3) {
+    const chunk = value.slice(index, index + 3);
+    const values = [];
+    for (const ch of chunk) {
+      const digit = BASE44_INDEX.get(ch);
+      if (digit === undefined) {
+        throw new ConfigError('INVALID_PAYLOAD', '二维码载荷含非法字符（可能扫描不完整或不是本工具生成）');
+      }
+      values.push(digit);
+    }
+    if (values.length === 3) {
+      const combined = values[0] + values[1] * 44 + values[2] * 1936;
+      if (combined > 0xffff) {
+        throw new ConfigError('INVALID_PAYLOAD', '二维码载荷数值越界（可能扫描不完整）');
+      }
+      bytes.push(combined >> 8, combined & 0xff);
+    } else {
+      bytes.push(values[0] + values[1] * 44);
+    }
+  }
+  return Uint8Array.from(bytes);
+}
+
+/**
+ * 序列化二维码承载的文本（v4 紧凑载荷）。
+ *
+ * 内置的 8 个能力位（name / url 映射）是固定集合，二维码里不再保存名称与完整 URL，
+ * 只保存「哪些能力位在用 + 每把 API Key」。key 的 base64url 字符按 6 bit 打包，
+ * 再用 base44 编码，整段是 QR 字母数字字符，二维码走 alphanumeric 模式。
+ *
+ * 二进制布局：
+ *   [0]      能力位位图（bit i = CAPABILITIES[i] 在用）
+ *   [1..2]   key 公共前缀长度（uint16）
+ *   [3..4]   所有 key 的长度（uint16）；0xFFFF 表示长度不一，后面逐项跟 uint16 长度
+ *   [...]    key 公共前缀 + 各 key 去掉前缀后的字符，按 6 bit 打包
+ *
+ * 调用方应传入已通过 validatePayload 的配置；不在内置能力位表里的地址无法编码。
+ * @param {{servers: Array<{name: string, url: string}>}} payload
  * @returns {string}
  */
 export function serializePayload(payload) {
-  return JSON.stringify({
-    type: payload.type ?? QR_TYPE,
-    version: payload.version ?? QR_VERSION,
-    servers: payload.servers,
+  const servers = Array.isArray(payload?.servers) ? payload.servers : [];
+  if (!servers.length) {
+    throw new ConfigError('INVALID_SERVERS', 'servers 列表为空');
+  }
+  if (servers.length > LIMITS.maxServers) {
+    throw new ConfigError('INVALID_SERVERS', `servers 数量超过上限 ${LIMITS.maxServers}`);
+  }
+  if (CAPABILITIES.length > 8) {
+    // 位图只有 1 字节；能力位表扩容时需要同步升级二维码格式
+    throw new ConfigError('PAYLOAD_TOO_LARGE', '内置能力位数量超过二维码格式上限');
+  }
+
+  const entries = servers.map((server) => {
+    const info = parseOfficialServerUrl(server.url, true);
+    const capabilityIndex = info ? CAPABILITIES.findIndex((capability) => capability.id === info.capabilityId) : -1;
+    if (!info || capabilityIndex < 0) {
+      throw new ConfigError(
+        'UNSUPPORTED_SERVER_URL',
+        '二维码只支持内置的 8 个官方能力位地址（https://qyapi.weixin.qq.com/mcp/v2/bot/<msg|doc|schedule|todo|meeting|contact|mail|disk>?apikey=...）',
+      );
+    }
+    if (info.apiKey.length > WECOM_APIKEY_MAX_LENGTH) {
+      throw new ConfigError('INVALID_API_KEY', `API Key 过长（最多 ${WECOM_APIKEY_MAX_LENGTH} 个字符）`);
+    }
+    return { capabilityIndex, apiKey: info.apiKey };
   });
+
+  const ordered = [...entries].sort((a, b) => a.capabilityIndex - b.capabilityIndex);
+  let mask = 0;
+  for (const entry of ordered) {
+    if (mask & (1 << entry.capabilityIndex)) {
+      // 防御：正常路径由 validatePayload 拦住；这里保证二维码里一个能力位只有一把 key
+      throw new ConfigError('DUPLICATE_CAPABILITY', '同一能力位只能配置一把 API Key');
+    }
+    mask |= 1 << entry.capabilityIndex;
+  }
+
+  const keys = ordered.map((entry) => entry.apiKey);
+  const prefix = longestCommonPrefix(keys);
+  const symbols = [];
+  for (const ch of prefix) symbols.push(BASE64URL_INDEX.get(ch));
+  for (const key of keys) {
+    for (const ch of key.slice(prefix.length)) symbols.push(BASE64URL_INDEX.get(ch));
+  }
+  if (symbols.some((value) => value === undefined)) {
+    throw new ConfigError('INVALID_PAYLOAD', '配置里有无法编码的 API Key 字符');
+  }
+
+  if (prefix.length > 0xfffe) {
+    throw new ConfigError('PAYLOAD_TOO_LARGE', 'API Key 公共前缀过长，无法写入二维码');
+  }
+  for (const key of keys) {
+    if (key.length > 0xfffe) {
+      throw new ConfigError('PAYLOAD_TOO_LARGE', 'API Key 过长，无法写入二维码');
+    }
+  }
+
+  const uniformLength = keys.every((key) => key.length === keys[0].length);
+  const header = [mask, prefix.length & 0xff, prefix.length >> 8];
+  if (uniformLength) {
+    header.push(keys[0].length & 0xff, keys[0].length >> 8);
+  } else {
+    header.push(0xff, 0xff);
+    for (const key of keys) header.push(key.length & 0xff, key.length >> 8);
+  }
+
+  const blob = Uint8Array.from([...header, ...packSymbols(symbols)]);
+  return PAYLOAD_MARKER + base44Encode(blob);
+}
+
+/**
+ * 解析 v4 紧凑载荷文本，展开成完整配置对象（仍需 validatePayload 做最终校验）。
+ * 名称与 URL 由内置能力位表还原：二维码里没有自定义名称/地址。
+ * @param {string} text
+ * @returns {{type: string, version: number, servers: Array<{name: string, url: string}>}}
+ */
+function decodePayloadText(text) {
+  const blob = base44Decode(text.slice(PAYLOAD_MARKER.length));
+  let offset = 0;
+  const readByte = () => {
+    if (offset >= blob.length) {
+      throw new ConfigError('INVALID_PAYLOAD', '二维码载荷不完整（可能扫描不完整），请重新扫描');
+    }
+    const value = blob[offset];
+    offset += 1;
+    return value;
+  };
+  const readBytes = (length) => {
+    if (!Number.isInteger(length) || length < 0 || offset + length > blob.length) {
+      throw new ConfigError('INVALID_PAYLOAD', '二维码载荷不完整（可能扫描不完整），请重新扫描');
+    }
+    const value = blob.subarray(offset, offset + length);
+    offset += length;
+    return value;
+  };
+  const readUint16 = () => readByte() | (readByte() << 8);
+
+  const mask = readByte();
+  const prefixLength = readUint16();
+  if (prefixLength > WECOM_APIKEY_MAX_LENGTH) {
+    throw new ConfigError('INVALID_PAYLOAD', '二维码载荷的 key 前缀过长');
+  }
+  const present = [];
+  for (let index = 0; index < CAPABILITIES.length; index += 1) {
+    if (mask & (1 << index)) present.push(index);
+  }
+  if (!present.length) {
+    throw new ConfigError('INVALID_SERVERS', '二维码里没有任何 MCP 连接');
+  }
+  const unknownBits = mask & ~((1 << CAPABILITIES.length) - 1);
+  if (unknownBits) {
+    throw new ConfigError('INVALID_PAYLOAD', '二维码载荷包含未知的能力位，请升级应用后重新生成');
+  }
+
+  const uniformLength = readUint16();
+  const keyLengths = [];
+  if (uniformLength === 0xffff) {
+    for (let index = 0; index < present.length; index += 1) keyLengths.push(readUint16());
+  } else {
+    for (let index = 0; index < present.length; index += 1) keyLengths.push(uniformLength);
+  }
+
+  let symbolCount = prefixLength;
+  for (const keyLength of keyLengths) {
+    if (keyLength < prefixLength || keyLength > WECOM_APIKEY_MAX_LENGTH) {
+      throw new ConfigError('INVALID_PAYLOAD', '二维码载荷的 API Key 长度不合法');
+    }
+    symbolCount += keyLength - prefixLength;
+  }
+  const symbolBytes = Math.ceil((symbolCount * 6) / 8);
+  const symbols = unpackSymbols(readBytes(symbolBytes), symbolCount);
+  const prefix = symbols.slice(0, prefixLength).map((value) => BASE64URL_CHARS[value]).join('');
+
+  let symbolOffset = prefixLength;
+  const servers = present.map((capabilityIndex, position) => {
+    const suffixLength = keyLengths[position] - prefixLength;
+    const suffix = symbols
+      .slice(symbolOffset, symbolOffset + suffixLength)
+      .map((value) => BASE64URL_CHARS[value])
+      .join('');
+    symbolOffset += suffixLength;
+    const apiKey = prefix + suffix;
+    const label = `第 ${position + 1} 个 MCP`;
+    if (apiKey.length > WECOM_APIKEY_MAX_LENGTH || WECOM_APIKEY_INVALID_CHARS.test(apiKey)) {
+      throw new ConfigError('INVALID_PAYLOAD', `${label}的 API Key 不合法`);
+    }
+    const capability = CAPABILITIES[capabilityIndex];
+    return {
+      name: displayNameForCapability(capability.id, position),
+      url: buildOfficialUrl(capability.id, apiKey),
+    };
+  });
+
+  return { type: QR_TYPE, version: QR_VERSION, servers };
 }
 
 // ---------------------------------------------------------------- 分片
@@ -455,9 +836,11 @@ export function splitIntoChunks(payloadText, options = {}) {
 }
 
 /**
- * 解析扫码文本：返回「完整配置」或「一片分片」。
+ * 解析扫码文本：返回「已展开的完整配置」或「一片分片」。
+ * 完整配置在这里就从 v4 紧凑载荷展开成完整 URL / 名称（名称与地址来自内置能力位表），
+ * 调用方只需再做 validatePayload 校验。
  * @param {string} scannedText
- * @returns {{kind: 'payload', payload: object} | {kind: 'chunk', chunk: {id: string, index: number, total: number}, data: string, checksum: string}}
+ * @returns {{kind: 'payload', payload: {type: string, version: number, servers: Array<{name: string, url: string}>}} | {kind: 'chunk', chunk: {id: string, index: number, total: number}, data: string, checksum: string}}
  */
 export function parseScannedText(scannedText) {
   const text = String(scannedText ?? '').trim();
@@ -465,6 +848,15 @@ export function parseScannedText(scannedText) {
   if (text.length > LIMITS.maxPayloadChars * 2) {
     throw new ConfigError('SCAN_TOO_LARGE', '二维码内容过大，可能不是企业微信 MCP 配置');
   }
+
+  // v4 紧凑载荷：base44 文本（字母数字），不是 JSON
+  if (!text.startsWith('{')) {
+    if (!text.startsWith(PAYLOAD_MARKER)) {
+      throw new ConfigError('NOT_JSON', '二维码内容不是本工具生成的配置（既不是 JSON 分片，也不是紧凑载荷）');
+    }
+    return { kind: 'payload', payload: decodePayloadText(text) };
+  }
+
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -477,9 +869,15 @@ export function parseScannedText(scannedText) {
   if (parsed.type !== QR_TYPE) {
     throw new ConfigError('INVALID_TYPE', '这不是 Rokid 企业微信助手配置二维码');
   }
-
+  const version = toPositiveInt(parsed.version, 0);
+  if (version !== QR_VERSION) {
+    if (version > QR_VERSION) {
+      throw new ConfigError('UNSUPPORTED_VERSION', `配置版本 ${version} 高于应用支持的 ${QR_VERSION}，请升级应用`);
+    }
+    throw new ConfigError('INVALID_VERSION', '配置缺少合法的 version 字段');
+  }
   if (parsed.chunk === undefined) {
-    return { kind: 'payload', payload: parsed };
+    throw new ConfigError('INVALID_PAYLOAD', '二维码内容缺少分片信息，请扫描本工具生成的二维码');
   }
 
   const chunk = parsed.chunk;

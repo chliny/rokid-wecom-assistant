@@ -24,7 +24,7 @@ export const USAGE = `Rokid 企业微信助手 终端二维码生成工具
     （msg 消息 / doc 文档 / schedule 日程 / todo 待办 / meeting 会议 / contact 通讯录 / mail 邮件 / disk 微盘）；
   · 粘贴的 URL 已到 /mcp/v2/bot/<能力> 但缺少 apikey 时，会再提示输入 API Key 并自动组合；
   · 最多配置 ${LIMITS.maxServers} 个连接；不同连接可使用各自独立的 URL / API Key。
-  · API Key 输入隐藏回显；非终端（管道）环境降级为普通读取并提示。
+  · API Key 仅支持英文字母、数字、- 和 _（base64url）；输入隐藏回显，非终端（管道）环境降级为普通读取并提示。
 
 选项：
   --name <名称>            MCP 名称，可重复（按出现顺序对应第 1、2… 个 Server）
@@ -35,12 +35,16 @@ export const USAGE = `Rokid 企业微信助手 终端二维码生成工具
   --mode <dark|light|auto> 终端配色，默认 auto（按终端背景自动判断）
   --dark / --light         等价于 --mode dark / --mode light
   --max-chars <n>          单个二维码承载的近似字符数，默认 ${DEFAULT_MAX_CHARS}（值越小越容易扫）；
+                           未显式指定时，终端里会自动按窗口尺寸缩小，保证每张二维码整屏可见；
                            实际每片还受二维码 2331 字节上限约束，超出时自动增加分片数
   --png <路径>             额外导出 PNG（多张时自动追加 -1、-2 后缀）；文件权限自动设为 600
   --svg <路径>             额外导出 SVG（多张时自动追加 -1、-2 后缀）；文件权限自动设为 600
   --file <路径>            从文件批量导入 MCP：JSON（{servers:[{name,url}]}）或每行一个 URL 的 TXT；
                            文件含真实凭据，建议先 chmod 600
   --help, -h               显示本帮助（即使同时存在其他非法参数也优先输出帮助）
+
+二维码内容是 v4 紧凑载荷（只存「哪些能力位在用 + 每把 API Key」，name/url 固化在代码里；
+key 的 6 bit 字符打包 + base44 编码，QR 走字母数字模式），8 个能力位约 282 字符，单张即可。
 
 退出码：0 成功；130 用户取消；1 参数或校验错误。
 安全：终端输出只显示脱敏后的 URL / API Key；二维码与导出文件均含真实凭据，请勿截图、提交 Git 或外传。`;
@@ -64,6 +68,7 @@ const VALUE_FLAGS = new Map([
  * @returns {{
  *   help: boolean,
  *   noInteractive: boolean,
+ *   maxCharsExplicit: boolean,
  *   mode: 'dark' | 'light' | 'auto',
  *   maxChars: number,
  *   png: string | null,
@@ -92,6 +97,7 @@ export function parseArgs(argv) {
     return {
       help: true,
       noInteractive: false,
+      maxCharsExplicit: false,
       mode: 'auto',
       maxChars: DEFAULT_MAX_CHARS,
       png: null,
@@ -229,5 +235,15 @@ export function parseArgs(argv) {
     });
   }
 
-  return { help, noInteractive, mode, maxChars, png, svg, files, servers };
+  return {
+    help,
+    noInteractive,
+    maxCharsExplicit: maxCharsValue !== null,
+    mode,
+    maxChars,
+    png,
+    svg,
+    files,
+    servers,
+  };
 }

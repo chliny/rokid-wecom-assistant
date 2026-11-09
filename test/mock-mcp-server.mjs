@@ -290,11 +290,16 @@ function registerWecomMockTools(server, state) {
     'contact_users_search',
     {
       description: '通过 keywords 搜索成员信息（open cli场景）',
+      // 官方 schema 没有 required（与实测 tools/list 一致），但服务端要求 keywords 必填：
+      // 空参调用返回 40058。探针不能把这种「schema 宽松、服务端严格」当成授权失败。
       inputSchema: { keywords: z.array(z.string()).min(1).max(10).optional() },
     },
-    async () => {
+    async ({ keywords }) => {
       if (state.invalidKey()) return businessError(850001, 'invalid apikey');
       if (blocked('contact_users_search')) return businessError(851008, 'capability not authorized');
+      if (!Array.isArray(keywords) || keywords.length === 0) {
+        return businessError(40058, "'keywords' 不合法，要求为 必填");
+      }
       await waitToolLatency();
       return ok({ users: [{ userid: 'zhangsan', name: '张三' }] });
     },

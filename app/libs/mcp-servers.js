@@ -16,6 +16,15 @@ import { silentLogger } from './log.js';
 export const CLIENT_INFO = { name: 'rokid-wecom-assistant', version: '1.0.0' };
 export const DEFAULT_CONNECT_TIMEOUT_MS = 20000;
 export const DEFAULT_CALL_TIMEOUT_MS = 30000;
+/**
+ * 单次 fetch 的显式超时。
+ *
+ * 设备上扫码后连接企业微信 MCP 时曾报 `request timeout (5000ms)`（表现为
+ * 「无法连接该 MCP」）。5000ms 的具体来源尚未在真机上确认；AIUI 文档提供
+ * `fetch(url, { timeout })`，这里为 MCP 的 HTTP 请求显式设置超时。
+ * SDK 的请求超时与底层 HTTP 超时相互独立；请求超时不一定能立即终止底层传输。
+ */
+export const DEFAULT_FETCH_TIMEOUT_MS = 60000;
 
 /** 面向用户的 MCP 错误类别。 */
 export const McpErrorCode = {
@@ -45,6 +54,26 @@ export class McpError extends Error {
     this.needRescan = options.needRescan === true;
     if (options.cause !== undefined) this.cause = options.cause;
   }
+}
+
+/**
+ * 包装运行时 fetch，为每次请求补上显式 `timeout`。
+ *
+ * 只在调用方没给 timeout 时补；具体宿主是否遵循该选项，需要在真机验证。
+ * 必须在**调用时**再取 `globalThis.fetch`：AIUI 运行时的 fetch 由宿主注入，
+ * 应用启动早期可能还没替换好。
+ * @param {{fetchImpl?: typeof fetch, timeoutMs?: number}} [options]
+ * @returns {(input: any, init?: any) => Promise<Response>}
+ */
+export function createFetchWithTimeout(options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+  const baseFetch = options.fetchImpl ?? ((...args) => globalThis.fetch(...args));
+  return function fetchWithTimeout(input, init) {
+    const nextInit = init && typeof init === 'object' ? { ...init } : {};
+    // 调用方给了合法 timeout 就用它的；否则补上，避免宿主套用很短的默认值。
+    if (typeof nextInit.timeout !== 'number') nextInit.timeout = timeoutMs;
+    return baseFetch(input, nextInit);
+  };
 }
 
 /**
@@ -104,6 +133,15 @@ export function classifyError(error, context = {}) {
     });
   }
 
+  const name = error && typeof error === 'object' ? String(error.name || '') : '';
+  const message = error && typeof error === 'object' ? String(error.message || '') : String(error ?? '');
+  const timeoutError = () =>
+    new McpError(McpErrorCode.TIMEOUT, `${serverName || 'MCP'}请求超时（网络较慢），请重试`, {
+      ...base,
+      retryable: true,
+      cause: error,
+    });
+
   if (error instanceof SdkError) {
     if (error.code === 'REQUEST_TIMEOUT') {
       return new McpError(McpErrorCode.TIMEOUT, `${serverName || 'MCP'}响应超时，请重试`, {
@@ -119,17 +157,20 @@ export function classifyError(error, context = {}) {
         cause: error,
       });
     }
+    // SDK 会把底层 fetch 的失败包进自己的错误（如版本协商失败），宿主层超时
+    // （AIUI 的 `request timeout (5000ms)` / `Request timeout after 5000ms`）
+    // 的原文会留在 message 里，这里按超时归类，不要显示成「协议错误」。
+    if (looksLikeTimeout(message, name)) return timeoutError();
     return new McpError(McpErrorCode.PROTOCOL, `${serverName}协议错误：${error.message}`, {
       ...base,
       cause: error,
     });
   }
 
-  const name = error && typeof error === 'object' ? String(error.name || '') : '';
-  const message = error && typeof error === 'object' ? String(error.message || '') : String(error ?? '');
   if (name === 'AbortError') {
     return new McpError(McpErrorCode.TIMEOUT, `${serverName}操作已取消`, { ...base, retryable: true, cause: error });
   }
+  if (looksLikeTimeout(message, name)) return timeoutError();
   if (name === 'TypeError' || /network|fetch|failed to fetch|load failed/i.test(message)) {
     return new McpError(McpErrorCode.NETWORK, `${serverName}网络请求失败，请检查网络后重试`, {
       ...base,
@@ -138,6 +179,17 @@ export function classifyError(error, context = {}) {
     });
   }
   return new McpError(McpErrorCode.UNKNOWN, `${serverName}${message || 'MCP 调用失败'}`, { ...base, cause: error });
+}
+
+/**
+ * 判断错误是否来自请求超时（含宿主 / 运行时层的超时文案）。
+ * @param {string} message
+ * @param {string} name
+ * @returns {boolean}
+ */
+function looksLikeTimeout(message, name) {
+  if (name === 'TimeoutError' || name === 'AbortError') return true;
+  return /timeout|timed out|超时/i.test(message);
 }
 
 /**
@@ -382,7 +434,8 @@ export class McpServerConnection {
 
     const sdk = deps.sdk ?? { Client, StreamableHTTPClientTransport };
     this._sdk = sdk;
-    this._fetch = deps.fetchImpl;
+    // 显式设置 HTTP 超时；设备上曾出现来源尚未确认的 5000ms 超时。
+    this._fetch = createFetchWithTimeout({ fetchImpl: deps.fetchImpl });
     this._timeoutMs = deps.timeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this._callTimeoutMs = deps.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
     this._logger = deps.logger ?? silentLogger;
@@ -518,10 +571,32 @@ export class McpServerConnection {
     }
 
     try {
-      await client.connect(transport, {
-        timeout: options.timeoutMs ?? this._timeoutMs,
-        signal: controller.signal,
+      // SDK 的 connect 超时只覆盖 initialize 请求；它之后等待的
+      // notifications/initialized 不受该请求计时器约束，因此还需给整个握手设限。
+      const timeoutMs = options.timeoutMs ?? this._timeoutMs;
+      let timer;
+      let onAbort;
+      const deadline = new Promise((_, reject) => {
+        onAbort = () => reject(new McpError(McpErrorCode.NETWORK, `${this.name}连接已取消`, { serverName: this.name }));
+        if (controller.signal.aborted) return onAbort();
+        controller.signal.addEventListener('abort', onAbort, { once: true });
+        timer = setTimeout(() => {
+          reject(new McpError(McpErrorCode.TIMEOUT, `${this.name}连接超时，请重试`, {
+            serverName: this.name,
+            retryable: true,
+          }));
+          controller.abort();
+        }, timeoutMs);
       });
+      try {
+        await Promise.race([
+          client.connect(transport, { timeout: timeoutMs, signal: controller.signal }),
+          deadline,
+        ]);
+      } finally {
+        clearTimeout(timer);
+        controller.signal.removeEventListener('abort', onAbort);
+      }
       if (generation !== this._generation) {
         throw new McpError(McpErrorCode.NETWORK, `${this.name}连接已取消`, { serverName: this.name });
       }
@@ -573,7 +648,7 @@ export class McpServerConnection {
         retryable: false,
       });
     }
-    const response = await client.listTools({
+    const response = await client.listTools(undefined, {
       timeout: options.timeoutMs ?? this._timeoutMs,
       signal: options.signal,
     });
@@ -652,7 +727,7 @@ export class McpServerConnection {
       const classified = classifyError(error, { serverName: this.name });
       // 会话失效 / 连接断开：重连一次后重试，避免用户重新扫码。
       // 仅只读工具可重放（retry !== false）；写操作重放会导致重复执行。
-      if (retryAllowed && classified.retryable && classified.code !== McpErrorCode.UNAUTHORIZED) {
+      if (retryAllowed && !options.signal?.aborted && classified.retryable && classified.code !== McpErrorCode.UNAUTHORIZED) {
         this._logger.warn(`工具调用失败，尝试重连：${toolName}`);
         await this._reconnect(options);
         const retryGeneration = this._generation;
@@ -692,7 +767,11 @@ export class McpServerConnection {
    * 只有 `tools/call` 才校验，因此必须挑「无必填参数的只读工具」实际调用一次。
    * 同一个能力位内部还按子能力分档授权，命中的探针可能恰好在未授权子能力上（851008），
    * 所以按得分依次尝试多个候选：任一成功即视为授权有效。
-   * @param {{timeoutMs?: number}} [options]
+   *
+   * 空参可能被业务校验拒绝（例如工具 schema 未标记必填参数），但业务错误本身
+   * 不能证明授权有效。遇到这类错误继续尝试其他候选；没有成功结果时报告探测失败，
+   * 不把无法验证误报为授权有效或授权失效。
+   * @param {{timeoutMs?: number, signal?: AbortSignal, retry?: boolean}} [options]
    * @returns {Promise<{verified: boolean, reason?: 'no-probe-tool'|'capability-unauthorized'|'probe-failed', toolName?: string, error?: McpError}>}
    */
   async verifyAuthorization(options = {}) {
@@ -714,10 +793,12 @@ export class McpServerConnection {
       try {
         const result = await this.callTool(probe.name, {}, {
           timeoutMs: options.timeoutMs ?? 15000,
+          signal: options.signal,
+          retry: options.retry,
           expectedTool: snapshot,
         });
         if (result.ok) return { verified: true, toolName: probe.name };
-        // 工具级失败但不是鉴权错误（isError）：换下一个候选再试
+        // 业务错误和工具级失败都不能证明授权有效，换下一个候选再试。
         failures.push(new McpError(McpErrorCode.TOOL, result.text, { serverName: this.name }));
       } catch (error) {
         const classified = classifyError(error, { serverName: this.name });

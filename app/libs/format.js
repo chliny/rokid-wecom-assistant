@@ -202,6 +202,6 @@ export function toSpeechText(text, options = {}) {
 export function formatError(error) {
   const message = error?.message || '操作失败';
   if (error?.needRescan) return `${message}\n请按确认键重新扫码授权`;
-  if (error?.code === 'TIMEOUT') return `${message}\n请再说一次或稍后重试`;
+  if (error?.code === 'TIMEOUT') return `${message}\n请稍后重试（弱网可先连接 Wi-Fi）`;
   return message;
 }

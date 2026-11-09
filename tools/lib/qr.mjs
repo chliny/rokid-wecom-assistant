@@ -7,7 +7,7 @@ import { closeSync, fchmodSync, openSync, unlinkSync, writeFileSync } from 'node
 import { rename, stat } from 'node:fs/promises';
 import path from 'node:path';
 import QRCode from 'qrcode';
-import { ConfigError, QR_BYTE_CAPACITY } from '../../app/libs/qr-payload.js';
+import { ConfigError, LIMITS, QR_BYTE_CAPACITY, splitIntoChunks } from '../../app/libs/qr-payload.js';
 import { resolveQrMode } from './terminal.mjs';
 
 export { QR_BYTE_CAPACITY };
@@ -140,6 +140,52 @@ export function estimateQrCells(text) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 按终端窗口尺寸自动缩小每张二维码的容量，返回「装得下」的最大 maxChars 与对应分片。
+ *
+ * 只在未显式指定 --max-chars 时使用：用户显式给了值就以用户为准（并保留原有超窗提示）。
+ * 二分查找最大的可用容量：容量越小 → 分片越多、每张越小，直到所有分片都能整屏显示。
+ * @param {string} text 完整载荷文本（紧凑配置）
+ * @param {{maxChars: number, maxBytes: number}} options 当前容量上限
+ * @returns {{maxChars: number, chunks: string[]} | null} 已经装得下或无法适配时返回 null
+ */
+export function fitChunksToTerminal(text, { maxChars, maxBytes }) {
+  const columns = process.stdout.columns;
+  const rows = process.stdout.rows;
+  if (!columns || !rows) return null;
+
+  const tryFit = (chars) => {
+    let chunks;
+    try {
+      chunks = splitIntoChunks(text, { maxChars: chars, maxBytes });
+    } catch {
+      return null; // 分片数超过上限等：这个容量不可用
+    }
+    const fits = chunks.every((chunk) => {
+      const size = estimateQrCells(chunk);
+      return size && size.columns <= columns && size.rows <= rows;
+    });
+    return fits ? chunks : null;
+  };
+
+  if (tryFit(maxChars)) return null; // 当前容量已经装得下，无需调整
+
+  let low = LIMITS.minChunkChars;
+  let high = maxChars;
+  let best = null;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const chunks = tryFit(middle);
+    if (chunks) {
+      best = { maxChars: middle, chunks };
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return best;
 }
 
 /**

@@ -4,7 +4,7 @@
 // 避免每次进入页面都重新 initialize 企业微信 MCP。
 import wx from 'wx';
 import { ConfigStore, createWxStorage, summarizeConfig } from './config-store.js';
-import { McpErrorCode, McpServers } from './mcp-servers.js';
+import { McpErrorCode, McpServers, isWriteTool } from './mcp-servers.js';
 import { Assistant } from './assistant.js';
 import { VoiceController } from './voice.js';
 import { createLogger } from './log.js';
@@ -172,95 +172,117 @@ function describeVerifyWarning(item) {
   if (item.reason === 'not-connected') {
     return `${name}：未连接${message ? `（${message}）` : ''}`;
   }
-  // 业务错误信息通常已带「Server 名：」前缀，避免重复拼接
-  if (message.startsWith(`${name}：`)) return message;
-  return message || `${name}：授权状态未确认`;
+  // 非授权错误不能证明授权有效，必须明确提示状态未确认。
+  const detail = message.startsWith(`${name}：`) ? message.slice(name.length + 1) : message;
+  return `${name}：授权状态未确认${detail ? `（${detail}）` : ''}`;
 }
 
 /**
- * 在保存前用一次性连接探测配置：连接、拉工具清单、实调只读工具验证授权，
- * 让用户先看到「能用哪些工具」再决定是否保存。
- *
- * 授权判定约定（scan 页依赖）：
- *   - 只有 UNAUTHORIZED（apikey 失效 / HTTP 401）才 authFailed 并阻止保存；
- *   - FORBIDDEN（851008 等能力位/子能力未授权）、连接失败、没有可探测的只读工具
- *     都只进 warnings，不阻止保存；
- *   - 返回 `{ok, tools, toolCount, authFailed, warnings}`。
+ * 扫码探测：整轮共享绝对截止时间，并仅复用同一完整配置中已完成的结果。
+ * verified 与 warning 都是终态，但 warning 绝不表示授权已验证。网络失败留待重试；
+ * apikey 无效阻止保存；无探针/能力不足维持原有带警告保存语义。
+ * cache 含凭据，只能留在页面内存，不能传给 setData/日志/持久化。
  * @param {Array<{name: string, url: string}>} serverConfigs
- * @param {{timeoutMs?: number}} [options]
- * @returns {Promise<{ok: boolean, error?: any, tools: Array<{name: string, serverName: string, write: boolean}>, toolCount: number, authFailed: boolean, warnings: string[]}>}
+ * @param {{timeoutMs?: number, signal?: AbortSignal, cache?: any}} [options]
  */
 export async function probeServers(serverConfigs, options = {}) {
-  const timeoutMs = options.timeoutMs ?? 15000;
-  const probe = new McpServers(serverConfigs, {
-    logger: getLogger(),
-    timeoutMs,
-    callTimeoutMs: timeoutMs,
+  const timeoutMs = options.timeoutMs ?? 150000;
+  const signature = JSON.stringify(serverConfigs.map(({ name, url }) => [name, url]));
+  const previous = options.cache?.signature === signature && Array.isArray(options.cache.entries)
+    ? options.cache.entries : [];
+  const entries = serverConfigs.map((_, index) => {
+    const entry = previous[index];
+    return entry && (entry.status === 'verified' || entry.status === 'warning') ? entry : null;
   });
-  /** @type {string[]} */
-  const warnings = [];
-  // 同一个 Server 的失败可能同时来自「连接失败」和后面的 verify 探测，
-  // 这里按 name 去重并统一补一次「name：」前缀，避免扫码页出现两条语义相同的警告。
-  const pushProbeWarning = (name, message) => {
-    const raw = String(message ?? '').trim();
-    if (!raw) return;
-    if (warnings.some((warning) => warning.startsWith(`${name}：`))) return;
-    // 错误信息本身可能已带 Server 名（如「坏 MCP网络请求失败」），先剥掉再统一拼一次前缀
-    const bare = raw.startsWith(name) ? raw.slice(name.length).replace(/^[：:]/, '').trim() : raw;
-    const text = raw.startsWith(`${name}：`) ? raw : `${name}：${bare || '连接失败'}`;
-    if (!warnings.includes(text)) warnings.push(text);
+  const probe = new McpServers(serverConfigs, { logger: getLogger() });
+  const controller = new AbortController();
+  let timedOut = false;
+  let externallyCancelled = false;
+  let timer;
+  let stopped;
+  let closing = false;
+  const deadline = Date.now() + timeoutMs;
+  const stop = new Promise((resolve) => { stopped = resolve; });
+  const cancel = () => {
+    if (!controller.signal.aborted) controller.abort();
+    // closeAll 也负责关闭已连接的 transport；不可等待不遵守取消的宿主。
+    if (!closing) {
+      closing = true;
+      Promise.resolve(probe.closeAll()).catch((error) => getLogger().warn('关闭探测连接失败', error));
+    }
+    stopped();
+  };
+  const onExternalAbort = () => { externallyCancelled = true; cancel(); };
+  if (options.signal?.aborted) onExternalAbort();
+  else options.signal?.addEventListener?.('abort', onExternalAbort, { once: true });
+  if (!controller.signal.aborted) {
+    timer = setTimeout(() => { timedOut = true; cancel(); }, Math.max(0, timeoutMs));
+  }
+  const expired = () => {
+    if (!controller.signal.aborted && Date.now() >= deadline) {
+      timedOut = true;
+      cancel();
+    }
+    return controller.signal.aborted;
+  };
+  let nextIndex = 0;
+  const worker = async () => {
+    while (!expired()) {
+      const index = nextIndex++;
+      if (index >= serverConfigs.length) return;
+      if (entries[index]) continue;
+      const connection = probe.connections[index];
+      const remaining = () => Math.max(1, deadline - Date.now());
+      try {
+        await connection.connect({ timeoutMs: Math.min(30000, remaining()), signal: controller.signal });
+        if (expired()) return;
+        const result = await connection.verifyAuthorization({
+          timeoutMs: Math.min(30000, remaining()), signal: controller.signal, retry: false,
+        });
+        if (expired()) return;
+        const tools = connection.tools.map((tool) => ({
+          name: tool.name, serverName: connection.name, write: isWriteTool(tool),
+        }));
+        if (result.verified) {
+          entries[index] = { status: 'verified', tools };
+        } else if (result.error?.code === McpErrorCode.UNAUTHORIZED) {
+          entries[index] = { status: 'unauthorized', error: result.error };
+        } else if (result.error?.retryable || result.error?.code === McpErrorCode.TIMEOUT || result.error?.code === McpErrorCode.NETWORK) {
+          entries[index] = { status: 'retry', error: result.error };
+        } else {
+          entries[index] = { status: 'warning', tools, warning: describeVerifyWarning({ name: connection.name, ...result }) };
+        }
+      } catch (error) {
+        if (expired()) return;
+        entries[index] = { status: error?.code === McpErrorCode.UNAUTHORIZED ? 'unauthorized' : 'retry', error };
+      }
+    }
   };
   try {
-    const results = await probe.connectAll({ timeoutMs });
-    for (const result of results) {
-      if (result.ok) continue;
-      pushProbeWarning(result.name, result.error?.message ?? '连接失败');
+    if (!expired()) {
+      const work = Promise.all(Array.from({ length: Math.min(4, serverConfigs.length) }, () => worker()));
+      await Promise.race([work, stop]);
+      expired();
     }
-    const ready = results.filter((result) => result.ok).length;
-    if (ready === 0) {
-      const unauthorized = results.find((result) => result.error?.code === McpErrorCode.UNAUTHORIZED);
-      return {
-        ok: false,
-        error: unauthorized?.error ?? results[0]?.error ?? new Error('无法连接该 MCP'),
-        tools: [],
-        toolCount: 0,
-        authFailed: Boolean(unauthorized),
-        warnings,
-      };
-    }
-    const verifies = await probe.verifyAuthorizationAll({ timeoutMs: 12000 });
-    let authError = null;
-    for (const item of verifies) {
-      if (item.verified) continue;
-      if (item.error?.code === McpErrorCode.UNAUTHORIZED) {
-        authError ??= item;
-        continue;
-      }
-      pushProbeWarning(item.name, describeVerifyWarning(item));
-    }
-    if (authError) {
-      return {
-        ok: false,
-        error: authError.error,
-        tools: [],
-        toolCount: 0,
-        authFailed: true,
-        warnings,
-      };
-    }
-    const tools = probe.tools.map((tool) => ({
-      name: tool.name,
-      serverName: tool.serverName,
-      write: tool.write,
-    }));
-    return { ok: true, tools, toolCount: tools.length, authFailed: false, warnings };
   } finally {
-    try {
-      await probe.closeAll();
-    } catch (error) {
-      getLogger().warn('关闭探测连接失败', error);
-    }
+    clearTimeout(timer);
+    options.signal?.removeEventListener?.('abort', onExternalAbort);
+    cancel();
   }
+  const auth = entries.find((entry) => entry?.status === 'unauthorized');
+  const hasFailed = entries.some((entry) => !entry || entry.status === 'retry');
+  const failed = entries.find((entry) => entry?.status === 'retry');
+  const completed = entries.filter((entry) => entry?.status === 'verified' || entry?.status === 'warning');
+  const tools = completed.flatMap((entry) => entry.tools ?? []);
+  const warnings = completed.filter((entry) => entry.status === 'warning').map((entry) => entry.warning);
+  const error = auth?.error ?? failed?.error ?? (timedOut ? new Error('验证授权超时，请重试失败项') : undefined);
+  return {
+    ok: !timedOut && !externallyCancelled && !auth && !hasFailed && completed.length > 0,
+    authFailed: Boolean(auth), error, tools, toolCount: tools.length, warnings,
+    completedCount: completed.length, totalCount: serverConfigs.length,
+    cache: { signature, entries: entries.map((entry) =>
+      entry?.status === 'verified' || entry?.status === 'warning' ? entry : null) },
+  };
 }
 
 /**

@@ -57,17 +57,29 @@ export function serverWarnings(server) {
   const warnings = [];
   if (!info.hasApiKey) warnings.push('⚠ 该 URL 未包含 apikey，眼镜端可能无法通过鉴权。');
   if (!info.officialPath) {
-    warnings.push('⚠ 该 URL 不在官方 /mcp/v2/bot/<能力> 路径下，请确认企业微信确实提供该地址。');
+    warnings.push('⚠ 该 URL 不在官方 /mcp/v2/bot/<能力> 路径下，二维码只支持内置的 8 个能力位地址。');
+  } else if (!info.capability) {
+    warnings.push('⚠ 该能力位不在内置的 8 个能力位中，二维码无法保存它（请升级工具）。');
+  }
+  const defaultName = info.capability?.name;
+  if (defaultName && server.name !== defaultName) {
+    warnings.push(`⚠ 自定义名称不会写入二维码，扫码后按能力位显示默认名称「${defaultName}」。`);
   }
   return warnings;
 }
 
 /**
- * 生成后的安全摘要：名称 + 脱敏 URL + 能力 + 分片数；授权有效性由眼镜端实际调用验证。
- * @param {{servers: Array<{name: string, url: string}>, chunkCount: number, mode: 'dark' | 'light', maxChars: number}} options
+ * 生成后的安全摘要：名称 + 脱敏 URL + 能力 + 编码 + 分片数；授权有效性由眼镜端实际调用验证。
+ * @param {{
+ *   servers: Array<{name: string, url: string}>,
+ *   chunkCount: number,
+ *   mode: 'dark' | 'light',
+ *   maxChars: number,
+ *   payloadChars: number,
+ * }} options
  * @returns {string}
  */
-export function formatSummary({ servers, chunkCount, mode, maxChars }) {
+export function formatSummary({ servers, chunkCount, mode, maxChars, payloadChars }) {
   const lines = [`配置摘要（MCP Server ${servers.length} 个 / 二维码 ${chunkCount} 张）：`];
   servers.forEach((server, index) => {
     const info = safeInspect(server.url);
@@ -88,9 +100,14 @@ export function formatSummary({ servers, chunkCount, mode, maxChars }) {
         : '（一张即可）'
     }`,
   );
+  if (payloadChars) {
+    lines.push(
+      `内容编码：紧凑载荷 v4（${payloadChars} 字符，QR 字母数字模式；名称与地址由内置的 8 个能力位还原）`,
+    );
+  }
   lines.push(`终端配色：${describeQrMode(mode)}`);
   lines.push('首次扫码时会验证授权；后续如连接或工具调用报告授权失效，请在企业微信重新授权并重新扫码。');
-  lines.push('安全提示：二维码内容包含真实 URL 与 API Key，请勿截图或转存外传。');
+  lines.push('安全提示：二维码内容包含真实凭据（可还原出完整 URL 与 API Key），请勿截图或转存外传。');
   if (mode === 'dark') {
     lines.push('提示：反色二维码（白码黑底）个别扫描器可能不识别，若眼镜扫不出，请加 --mode light 重新生成。');
   }

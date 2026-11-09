@@ -1,49 +1,38 @@
-// 企业微信官方远程 MCP：能力清单、URL 组装、API Key 校验与输入分类。
+// 企业微信官方远程 MCP：URL 组装、API Key 校验与输入分类。
 //
 // 本模块是纯函数（不读写终端、不读写文件），既供交互式 CLI 使用，也可被脚本复用。
+// 能力位清单、官方 URL 形态与 API Key 规则放在共享模块 app/libs/wecom-mcp.js：
+// 眼镜端还原紧凑配置二维码时要用同一份定义，这里只做 re-export，避免两端漂移。
 // 官方 URL 形态（实测；取证记录为本地未入库的 `.refs/NOTES-wecom-mcp.md`，clone 后不存在，
 // 仅作来源说明，本模块不依赖该路径）：
 //   https://qyapi.weixin.qq.com/mcp/v2/bot/<capability>?apikey=<KEY>
 // 鉴权只支持 query 参数 apikey（没有 Bearer / OAuth），每个能力位分别配置凭据。授权有效期以官方对具体能力的说明和服务端实际校验为准。
 
 import { ConfigError } from '../../app/libs/qr-payload.js';
+import {
+  CAPABILITIES,
+  WECOM_APIKEY_INVALID_CHARS,
+  WECOM_APIKEY_MAX_LENGTH,
+  WECOM_APIKEY_PARAM,
+  WECOM_MCP_ORIGIN,
+  WECOM_MCP_PATH_PREFIX,
+  displayNameForCapability,
+  findCapability,
+} from '../../app/libs/wecom-mcp.js';
 
-export const MCP_ORIGIN = 'https://qyapi.weixin.qq.com';
-export const MCP_PATH_PREFIX = '/mcp/v2/bot/';
-export const APIKEY_PARAM = 'apikey';
-export const APIKEY_MAX_LENGTH = 512;
+export { CAPABILITIES, displayNameForCapability, findCapability };
+
+export const MCP_ORIGIN = WECOM_MCP_ORIGIN;
+export const MCP_PATH_PREFIX = WECOM_MCP_PATH_PREFIX;
+export const APIKEY_PARAM = WECOM_APIKEY_PARAM;
+export const APIKEY_MAX_LENGTH = WECOM_APIKEY_MAX_LENGTH;
 
 /** 官方能力路径：/mcp/v2/bot/<capability> */
 const OFFICIAL_PATH_PATTERN = /^\/mcp\/v(\d+)\/bot\/([A-Za-z0-9_-]+)\/?$/;
 /** 带协议头的输入才当作 URL，否则当作 API Key 尝试。 */
 const URL_LIKE_PATTERN = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
-/** API Key 中不允许出现的字符：空白、控制字符、会破坏 URL 查询串的 & # ?。 */
-const INVALID_APIKEY_CHARS = /[\s\u0000-\u001f\u007f&#?]/;
-
-/**
- * 官方实测存在的 8 个能力位（一个能力位 = 一条独立授权的 URL）。
- * toolCount 来自 tools/list 实测，仅用于菜单提示。
- */
-export const CAPABILITIES = Object.freeze([
-  { id: 'msg', label: '消息', name: '企业微信消息', toolCount: 6, summary: '会话列表、收发消息' },
-  { id: 'doc', label: '文档', name: '企业微信文档', toolCount: 63, summary: '文档 / 表格 / 智能表格 / 智能文档' },
-  { id: 'schedule', label: '日程', name: '企业微信日程', toolCount: 9, summary: '日程与会议室查询' },
-  { id: 'todo', label: '待办', name: '企业微信待办', toolCount: 6, summary: '待办事项读写' },
-  { id: 'meeting', label: '会议', name: '企业微信会议', toolCount: 10, summary: '会议、会议室与转写原文' },
-  { id: 'contact', label: '通讯录', name: '企业微信通讯录', toolCount: 1, summary: '成员搜索' },
-  { id: 'mail', label: '邮件', name: '企业微信邮件', toolCount: 5, summary: '邮件读写' },
-  { id: 'disk', label: '微盘', name: '企业微信微盘', toolCount: 10, summary: '微盘文件与文件夹' },
-]);
-
-/**
- * 按能力代号查找能力定义。
- * @param {string} capabilityId
- * @returns {(typeof CAPABILITIES)[number] | null}
- */
-export function findCapability(capabilityId) {
-  const id = String(capabilityId ?? '').trim().toLowerCase();
-  return CAPABILITIES.find((capability) => capability.id === id) ?? null;
-}
+/** API Key 中不允许出现的字符（与共享模块同一份定义）。 */
+const INVALID_APIKEY_CHARS = WECOM_APIKEY_INVALID_CHARS;
 
 /**
  * 能力菜单文本（编号 1-8），给交互式 CLI 打印用。
@@ -72,18 +61,6 @@ export function parseCapabilityChoice(text) {
 }
 
 /**
- * 按能力位给出默认 MCP 名称（与官方 JSON Config 的命名习惯一致）。
- * @param {string | null} capabilityId
- * @param {number} [index]
- * @returns {string}
- */
-export function displayNameForCapability(capabilityId, index = 0) {
-  const capability = findCapability(capabilityId);
-  if (capability) return capability.name;
-  return index > 0 ? `企业微信 MCP ${index + 1}` : '企业微信 MCP';
-}
-
-/**
  * 判断输入是否带协议头（形如 https://...）。
  * @param {string} text
  * @returns {boolean}
@@ -105,7 +82,7 @@ export function validateApiKey(raw, label = 'API Key') {
     throw new ConfigError('INVALID_API_KEY', `${label}过长（最多 ${APIKEY_MAX_LENGTH} 个字符）`);
   }
   if (INVALID_APIKEY_CHARS.test(value)) {
-    throw new ConfigError('INVALID_API_KEY', `${label}格式不正确：不能包含空格、& # ? 或控制字符`);
+    throw new ConfigError('INVALID_API_KEY', `${label} 格式不正确：仅支持英文字母、数字、- 和 _（base64url）`);
   }
   return value;
 }

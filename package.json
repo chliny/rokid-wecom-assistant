@@ -14,6 +14,7 @@
     "test": "node --test test/",
     "mock:server": "node test/mock-mcp-server.mjs",
     "preview": "aix preview ./app",
+    "preview:qr": "node tools/dev/preview-qr.mjs",
     "pack": "mkdir -p dist && aix pack ./app -o dist/wecom-assistant.aix"
   },
   "dependencies": {

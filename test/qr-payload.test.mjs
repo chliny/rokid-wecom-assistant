@@ -17,13 +17,20 @@ import {
 const APIKEY = 'apikey-secret-123456';
 const OFFICIAL_URL = `https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=${APIKEY}`;
 
+import { CAPABILITIES } from '../app/libs/wecom-mcp.js';
+
+const CAPABILITY_IDS = CAPABILITIES.map((capability) => capability.id);
+const DEFAULT_NAMES = CAPABILITIES.map((capability) => capability.name);
+
+/** 生成最多 8 个连接（每个能力位一把 key；二维码里不保存名称，扫码后按能力位还原默认名称）。 */
 function officialServers(count = 1, keyLength = 24) {
-  const capabilities = ['msg', 'doc', 'schedule', 'todo', 'meeting', 'contact', 'mail', 'disk'];
+  if (count > CAPABILITY_IDS.length) throw new Error('能力位固定 8 个，最多 8 个连接');
   return Array.from({ length: count }, (_, index) => {
-    const capability = capabilities[index % capabilities.length];
-    const key = 'k'.repeat(keyLength) + String(index);
+    const capability = CAPABILITY_IDS[index];
+    // key 首字符按序号区分：避免所有 key 共享前缀，分片用例才测得到「大配置」
+    const key = String(index).padStart(2, '0') + 'k'.repeat(keyLength);
     return {
-      name: `企业微信-${capability}-${index}`,
+      name: DEFAULT_NAMES[index],
       url: `https://qyapi.weixin.qq.com/mcp/v2/bot/${capability}?apikey=${key}`,
     };
   });
@@ -55,22 +62,26 @@ test('非官方地址一律拒绝：http、非企微域名、缺少 apikey', () 
 });
 
 test('单张二维码即可承载的配置，扫码后直接解析为配置对象', () => {
-  // 最常见路径：1~2 个连接时生成单张二维码，扫一次就要能用（分片分支不能取代它）。
+  // 最常见路径：少量连接时生成单张二维码，扫一次就要能用（分片分支不能取代它）。
   const servers = officialServers(2);
   const payloadText = serializePayload(buildPayload(servers));
   const parsed = parseScannedText(payloadText);
   assert.equal(parsed.kind, 'payload');
   const validated = validatePayload(parsed.payload);
   assert.equal(validated.servers.length, 2);
+  // 名称与 URL 由内置能力位表还原
   assert.deepEqual(
     validated.servers.map((server) => server.name),
-    servers.map((server) => server.name),
+    ['企业微信消息', '企业微信文档'],
   );
-  assert.equal(validated.servers[0].url, servers[0].url);
+  assert.deepEqual(
+    validated.servers.map((server) => server.url),
+    servers.map((server) => server.url),
+  );
 });
 
-test('32 个 MCP 连接的大型配置可分片乱序重组并通过眼镜端校验', () => {
-  const servers = officialServers(32, 1300);
+test('8 个能力位的长 key 配置可分片乱序重组并通过眼镜端校验', () => {
+  const servers = officialServers(8, 300);
   const payloadText = serializePayload(buildPayload(servers));
   assert.ok(payloadText.length > 900, '样本必须真的超过单张二维码容量');
 
@@ -94,48 +105,86 @@ test('32 个 MCP 连接的大型配置可分片乱序重组并通过眼镜端校
 
   assert.equal(outcome.status, 'complete');
   assert.equal(outcome.text, payloadText, '重组结果必须与原始配置逐字一致');
-  const validated = validatePayload(JSON.parse(outcome.text));
-  assert.equal(validated.servers.length, 32);
+  const validated = validatePayload(parseScannedText(outcome.text).payload);
+  assert.equal(validated.servers.length, 8);
+  assert.deepEqual(
+    validated.servers.map((server) => server.url),
+    servers.map((server) => server.url),
+  );
 });
 
-test('按字节上限分片：32 个长中文名配置的每一张二维码都不超出真实容量', () => {
-  // 二维码真实容量按 UTF-8 字节算（中文 3 字节/字），只按字符数分片会让
-  // 「字符数没超、字节超标」的配置生成失败，用户无法完成授权。
-  const longName = '企业微信消息能力位配置名称说明文字补充内容占位扩展字段'.repeat(2);
-  const servers = Array.from({ length: 32 }, (_, index) => ({
-    name: `${longName.slice(0, 38)}${String(index).padStart(2, '0')}`,
-    url: `https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=${'k'.repeat(12)}${String(index).padStart(2, '0')}`,
+test('v4 紧凑载荷只存能力位与 key，扫码后按内置映射还原名称与地址', () => {
+  // 8 个能力位的 name/url 映射固化在 app/libs/wecom-mcp.js，二维码只保存「哪些能力位在用 +
+  // 每把 API Key」；两端必须用同一份映射，名字/地址才不会对不上。
+  const shared = `FAKE-shared-prefix-${'X'.repeat(50)}`;
+  const servers = CAPABILITY_IDS.map((capability, index) => ({
+    // 自定义名称（mail 改个名）不会写入二维码，扫码后按能力位显示默认名称
+    name: index === 6 ? '企业微信邮箱' : DEFAULT_NAMES[index],
+    url: `https://qyapi.weixin.qq.com/mcp/v2/bot/${capability}?apikey=${shared}${String(index).padStart(2, '0')}${'ta'.repeat(10)}`,
   }));
-  const payloadText = serializePayload(buildPayload(servers));
-  const encoder = new TextEncoder();
-  assert.ok(encoder.encode(payloadText).length > QR_BYTE_CAPACITY, '样本必须真的超过单张二维码的字节容量');
 
-  const chunks = splitIntoChunks(payloadText, { maxChars: 2000, maxBytes: QR_BYTE_CAPACITY });
-  assert.ok(chunks.length > 1, '应当被切成多张二维码');
-  for (const chunk of chunks) {
-    assert.ok(chunk.length <= 2000, `分片字符数超限：${chunk.length}`);
-    const bytes = encoder.encode(chunk).length;
-    assert.ok(bytes <= QR_BYTE_CAPACITY, `分片 ${bytes} 字节，超过二维码容量 ${QR_BYTE_CAPACITY} 字节`);
-  }
-
-  // 真实扫描顺序不可控：乱序扫完必须能重组并通过眼镜端校验
+  const payload = validatePayload(buildPayload(servers));
+  const text = serializePayload(payload);
+  // 分片往返：故意用较小的每张容量
+  const chunks = splitIntoChunks(text, { maxChars: 200, maxBytes: QR_BYTE_CAPACITY });
+  assert.ok(chunks.length > 1, '样本应被切成多张，覆盖分片重组');
   const assembler = createChunkAssembler();
   let outcome;
-  for (const index of [...chunks.keys()].reverse()) {
-    const parsed = parseScannedText(chunks[index]);
+  for (const chunk of chunks) {
+    const parsed = parseScannedText(chunk);
     assert.equal(parsed.kind, 'chunk');
     outcome = assembler.add(parsed.chunk, parsed.data, parsed.checksum);
   }
   assert.equal(outcome.status, 'complete');
-  assert.equal(outcome.text, payloadText, '重组结果必须与原始配置逐字一致');
-  assert.equal(validatePayload(JSON.parse(outcome.text)).servers.length, 32);
+
+  const scanned = parseScannedText(outcome.text);
+  assert.equal(scanned.kind, 'payload');
+  const decoded = validatePayload(scanned.payload);
+  assert.deepEqual(decoded.servers.map((server) => server.url), servers.map((server) => server.url));
+  // 自定义名称不写入二维码，扫码后显示对应的默认名称。
+  assert.equal(decoded.servers.find((server) => server.url.includes('/bot/mail?'))?.name, '企业微信邮件');
+
+  // 只支持内置的 8 个官方能力位：自定义路径/未知能力位无法编码
+  assert.throws(
+    () => serializePayload(validatePayload(buildPayload([{ name: '自建', url: 'https://qyapi.weixin.qq.com/custom/path?apikey=k' }]))),
+    (error) => error.code === 'UNSUPPORTED_SERVER_URL',
+  );
+  assert.throws(
+    () => serializePayload(validatePayload(buildPayload([{ name: '未知', url: 'https://qyapi.weixin.qq.com/mcp/v2/bot/ticket?apikey=k' }]))),
+    (error) => error.code === 'UNSUPPORTED_SERVER_URL',
+  );
+
+  // 同一能力位只能配一把 key（二维码按能力位存储）
+  assert.throws(
+    () =>
+      validatePayload(
+        buildPayload([
+          { name: '消息A', url: 'https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=aaa' },
+          { name: '消息B', url: 'https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=bbb' },
+        ]),
+      ),
+    (error) => error.code === 'DUPLICATE_CAPABILITY',
+  );
+
+  // 残缺/非法载荷必须报配置错误，不能拿半份配置去连接（也不能抛原生 TypeError）
+  assert.throws(() => parseScannedText('RWA4'), (error) => error.code === 'INVALID_PAYLOAD');
+  assert.throws(
+    () => parseScannedText(`${text.slice(0, 20)}_`),
+    (error) => error.code === 'INVALID_PAYLOAD',
+    '含 base44 字符集外的字符必须被拒绝',
+  );
+  assert.throws(
+    () => parseScannedText(JSON.stringify({ type: 'rokid-wecom-assistant', version: 4 })),
+    (error) => error.code === 'INVALID_PAYLOAD',
+    'JSON 但缺少分片信息必须拒绝',
+  );
 });
 
 test('扫码分片字段严格校验：非法序号与非字符串内容必须拒绝', () => {
   // 摄像头扫到的内容是外部入口：非整数序号（"1x"/1.5）若被 parseInt 截断，
   // 会悄悄覆盖别的分片，最终 CRC 校验失败时才报错，用户只能重扫全部。
-  const makeScanned = (chunk, data = '{"type":"rokid-wecom-assistant","version":1,"servers":[]}') =>
-    JSON.stringify({ type: 'rokid-wecom-assistant', version: 1, chunk, checksum: 'deadbeef', data });
+  const makeScanned = (chunk, data = '{"type":"rokid-wecom-assistant","version":4}') =>
+    JSON.stringify({ type: 'rokid-wecom-assistant', version: 4, chunk, checksum: 'deadbeef', data });
 
   const invalidChunks = [
     ['序号不是整数："1x"', { id: 'abcdef12', index: '1x', total: 3 }],

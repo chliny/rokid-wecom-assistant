@@ -7,8 +7,9 @@
 //   node tools/wecom-mcp-qr.mjs --no-interactive \
 //     --name 企业微信消息 --url 'https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=KEY'
 //
-// 二维码内容 = 共享协议模块（app/libs/qr-payload.js）定义的 payload：
-//   {"type":"rokid-wecom-assistant","version":1,"servers":[...]}
+// 二维码内容 = 共享协议模块（app/libs/qr-payload.js）定义的紧凑配置（version 2）：
+//   {"type":"rokid-wecom-assistant","version":2,"p":"<key 公共前缀>","s":[["msg","<key 后缀>"],...]}
+// 只存能力位 + key 片段，默认名称与完整 URL 由眼镜端还原，二维码更小、更少。
 // 内容超出一个二维码容量时自动分片，逐张显示「请依次扫描 第 i/N 张」。
 // 终端输出只展示脱敏后的 URL / API Key；二维码图像里才是真实的配置。
 
@@ -59,6 +60,7 @@ import {
   assertExportDirectory,
   cleanupOwnTempFilesSync,
   estimateQrCells,
+  fitChunksToTerminal,
   renderTerminalQr,
   writePngFile,
   writeSvgFile,
@@ -178,6 +180,8 @@ async function promptServer(prompter, existingServers) {
       if (!name) name = displayNameForCapability(capabilityId, index);
       // 复用协议模块的完整校验（https / 域名白名单 / 重复 URL / 数量上限等）
       const payload = validatePayload(buildPayload([...existingServers, { name, url }]));
+      // 提交连接前检查二维码编码限制，让交互式用户能立即更正 URL 或 Key。
+      serializePayload(payload);
       const server = payload.servers[payload.servers.length - 1];
       if (existingServers.some((existing) => existing.name === server.name)) {
         write(`⚠ 名称“${server.name}”已存在，允许继续（URL 不同）。`);
@@ -308,15 +312,29 @@ function printPreview(servers) {
  * 所有二维码先渲染成字符串（同时校验容量），成功后才打印表头，避免渲染失败时已输出
  * 「配置已生成」之类的误导信息。
  * @param {{type: string, version: number, servers: Array<{name: string, url: string}>}} payload
+ * @param {string} payloadText 二维码承载的紧凑配置文本
  * @param {ReturnType<typeof parseArgs>} options
  * @param {boolean} showPreview 非交互模式下先打印配置预览
  */
-async function emitQr(payload, options, showPreview) {
-  const payloadText = serializePayload(payload);
+async function emitQr(payload, payloadText, options, showPreview) {
   const chunks = splitIntoChunks(payloadText, {
     maxChars: options.maxChars,
     maxBytes: QR_BYTE_CAPACITY,
   });
+  // 未显式指定 --max-chars 时，按终端窗口自动缩小每张容量，保证整屏可见（显式指定则以用户为准）。
+  // 导出 PNG/SVG 时二维码不靠终端显示，跳过自动适配，避免把文件拆成一堆碎片。
+  let effectiveMaxChars = options.maxChars;
+  let fittedChunks = null;
+  if (process.stdout.isTTY && !options.maxCharsExplicit && !options.png && !options.svg) {
+    fittedChunks = fitChunksToTerminal(payloadText, {
+      maxChars: options.maxChars,
+      maxBytes: QR_BYTE_CAPACITY,
+    });
+    if (fittedChunks) {
+      effectiveMaxChars = fittedChunks.maxChars;
+      chunks.splice(0, chunks.length, ...fittedChunks.chunks);
+    }
+  }
   const mode = resolveQrMode(options.mode);
 
   // 先确认导出目录可用，避免整张二维码打印完才报错
@@ -344,13 +362,27 @@ async function emitQr(payload, options, showPreview) {
 
     write('配置已生成，请使用 Rokid 眼镜扫描：');
     write('');
+    if (fittedChunks) {
+      write(
+        `已按终端窗口 ${process.stdout.columns}×${process.stdout.rows} 自动调整为每张 ≤ ${effectiveMaxChars} 字符（共 ${chunks.length} 张），避免二维码超出可见范围。`,
+      );
+      const single = estimateQrCells(payloadText);
+      if (chunks.length > 1 && single) {
+        write(
+          `若想减少扫描张数：把终端放大到 ≥ ${single.columns} 列 × ${single.rows} 行（一张扫完），或用 --png 导出后用图片查看器扫描。`,
+        );
+      } else if (chunks.length > 1) {
+        write('若想减少扫描张数：分别拉宽、拉高终端窗口，或用 --png 导出后用图片查看器扫描。');
+      }
+      write('');
+    }
 
     for (let index = 0; index < chunks.length; index += 1) {
       if (chunks.length > 1) write(`请依次扫描 第 ${index + 1}/${chunks.length} 张`);
       else write('[终端二维码]');
 
-      const qrText = renderedChunks[index];
-      process.stdout.write(qrText.endsWith('\n') ? qrText : `${qrText}\n`);
+      const rendered = renderedChunks[index];
+      process.stdout.write(rendered.endsWith('\n') ? rendered : `${rendered}\n`);
       if (chunks.length > 1) write('');
 
       if (process.stdout.isTTY) {
@@ -373,7 +405,8 @@ async function emitQr(payload, options, showPreview) {
         servers: payload.servers,
         chunkCount: chunks.length,
         mode,
-        maxChars: options.maxChars,
+        maxChars: effectiveMaxChars,
+        payloadChars: payloadText.length,
       }),
     );
   } finally {
@@ -407,7 +440,8 @@ async function main() {
       servers = resolveServerSpecs([...options.servers, ...fileServers]);
     }
     const payload = validatePayload(buildPayload(servers));
-    await emitQr(payload, options, !interactive);
+    const payloadText = serializePayload(payload);
+    await emitQr(payload, payloadText, options, !interactive);
     return 0;
   } finally {
     prompter?.close();

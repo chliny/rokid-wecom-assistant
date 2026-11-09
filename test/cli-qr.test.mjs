@@ -8,9 +8,18 @@ import { fileURLToPath } from 'node:url';
 import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { CAPABILITIES } from '../app/libs/wecom-mcp.js';
 
 const CLI = fileURLToPath(new URL('../tools/wecom-mcp-qr.mjs', import.meta.url));
 const APIKEY = 'cli-secret-key-9f8e7d';
+
+/**
+ * 生成互不共享前缀的长 key：紧凑格式会提取所有 key 的公共前缀，key 前缀相同会让
+ * 「大配置」凭空压缩成一张二维码，分片用例就测不到真实的多张路径了。
+ */
+function uniqueKey(index, length = 400) {
+  return `${index}${'k'.repeat(length)}`;
+}
 
 function runCli(args) {
   return spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8', timeout: 30000 });
@@ -64,21 +73,56 @@ test('终端输出包含可扫描二维码，但绝不打印完整 API Key', () 
   assert.match(result.stdout, /apikey=\*{4}/, '预览应为脱敏 URL');
 });
 
+test('URL 中的超长 API Key 不得生成眼镜无法解析的二维码', () => {
+  const key = 'k'.repeat(513);
+  const result = runCli([
+    '--no-interactive', '--name', '企业微信消息',
+    '--url', `https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=${key}`,
+    '--mode', 'light',
+  ]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /API Key 过长/);
+  assert.doesNotMatch(result.stdout, /\[终端二维码\]/);
+  assert.ok(!result.stderr.includes(key), '错误信息不得泄露密钥');
+});
+
+test('含不支持字符的 Key 在交互录入时提示并允许更正', () => {
+  const result = spawnSync(process.execPath, [CLI, '--mode', 'light'], {
+    encoding: 'utf8', timeout: 30000,
+    input: '\n\nsecret.with.dot\nvalid_key-123\nmsg\nn\n',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /API Key 格式不正确：仅支持英文字母、数字、- 和 _/);
+  assert.match(result.stdout, /\[终端二维码\]/);
+  assert.ok(!result.stdout.includes('secret.with.dot'));
+});
+
+test('含不支持字符的 URL 在交互录入时提示并允许更正', () => {
+  const result = spawnSync(process.execPath, [CLI, '--mode', 'light'], {
+    encoding: 'utf8', timeout: 30000,
+    input: '\nhttps://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=secret%2Ewith%2Edot\n\nhttps://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=valid_key-123\nn\n',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /API Key 格式不正确：仅支持英文字母、数字、- 和 _/);
+  assert.match(result.stdout, /\[终端二维码\]/);
+  assert.ok(!result.stdout.includes('secret.with.dot'));
+});
+
 test('配置超出单张二维码容量时自动分片，并提示逐张扫描', () => {
   const result = runCli([
     '--no-interactive',
     '--name',
     '企业微信消息',
     '--url',
-    `https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=${'k'.repeat(400)}`,
+    `https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=${uniqueKey(0)}`,
     '--name',
     '企业微信文档',
     '--url',
-    `https://qyapi.weixin.qq.com/mcp/v2/bot/doc?apikey=${'d'.repeat(400)}`,
+    `https://qyapi.weixin.qq.com/mcp/v2/bot/doc?apikey=${uniqueKey(1)}`,
     '--name',
     '企业微信日程',
     '--url',
-    `https://qyapi.weixin.qq.com/mcp/v2/bot/schedule?apikey=${'s'.repeat(400)}`,
+    `https://qyapi.weixin.qq.com/mcp/v2/bot/schedule?apikey=${uniqueKey(2)}`,
     '--mode',
     'light',
   ]);
@@ -89,21 +133,39 @@ test('配置超出单张二维码容量时自动分片，并提示逐张扫描',
   assert.ok(!result.stdout.includes('k'.repeat(400)), '分片输出泄露了完整 API Key');
 });
 
-test('从 JSON/TXT 配置文件导入多个独立 Token，最多可生成 32 个连接且不泄露凭据', () => {
+test('从 JSON/TXT 配置文件导入多个独立 Token（每个能力位一把 key）且不泄露凭据', () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'wecom-mcp-file-'));
+  const capabilities = CAPABILITIES.map((capability) => capability.id);
   try {
     const jsonPath = path.join(dir, 'servers.json');
-    const jsonServers = Array.from({ length: 32 }, (_, index) => ({
+    const jsonServers = capabilities.map((capability, index) => ({
       name: `测试连接${index + 1}`,
-      url: `https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=batch-token-${index}-secret`,
+      url: `https://qyapi.weixin.qq.com/mcp/v2/bot/${capability}?apikey=${uniqueKey(index)}`,
     }));
     writeFileSync(jsonPath, JSON.stringify({ servers: jsonServers }), { mode: 0o600 });
 
     const jsonResult = runCli(['--no-interactive', '--file', jsonPath, '--mode', 'light']);
     assert.equal(jsonResult.status, 0, jsonResult.stderr);
-    assert.match(jsonResult.stdout, /MCP Server 32 个/);
-    assert.match(jsonResult.stdout, /请依次扫描\s*第\s*1\/\d+\s*张/);
-    assert.ok(!jsonResult.stdout.includes('batch-token-0-secret'), 'JSON 文件中的完整 Token 不得出现在控制台输出');
+    assert.match(jsonResult.stdout, /MCP Server 8 个/);
+    assert.match(jsonResult.stdout, /请依次扫描\s*第\s*1\/\d+\s*张/, '长 key 配置应分成多张');
+    assert.ok(!jsonResult.stdout.includes(uniqueKey(0)), 'JSON 文件里的完整 Token 不得出现在控制台输出');
+
+    // 能力位固定 8 个：同一能力位重复配置必须明确报错，而不是静默丢一把 key
+    const duplicatePath = path.join(dir, 'duplicate.json');
+    writeFileSync(
+      duplicatePath,
+      JSON.stringify({
+        servers: [
+          { name: '消息A', url: 'https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=aaa' },
+          { name: '消息B', url: 'https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=bbb' },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    const duplicateResult = runCli(['--no-interactive', '--file', duplicatePath, '--mode', 'light']);
+    assert.equal(duplicateResult.status, 1);
+    assert.match(duplicateResult.stderr, /DUPLICATE_CAPABILITY/);
+    assert.ok(!duplicateResult.stdout.includes('[终端二维码]'), '重复能力位不应生成二维码');
 
     const txtPath = path.join(dir, 'servers.txt');
     writeFileSync(
@@ -140,6 +202,23 @@ test('非官方地址被拒绝：http 地址不会生成二维码', () => {
   assert.ok(!result.stdout.includes('[终端二维码]'), '非法配置不应生成二维码');
 });
 
+test('8 个能力位配置生成单张 v4 紧凑二维码，且不泄露完整 Key', () => {
+  // 用户最常遇到的场景：8 个能力位 + 同源 API Key（共享长前缀）。紧凑格式应能一张扫完。
+  const shared = `FAKE-shared-prefix-${'X'.repeat(50)}`;
+  const capabilities = CAPABILITIES.map((capability) => capability.id);
+  const serverArgs = [];
+  capabilities.forEach((capability, index) => {
+    serverArgs.push('--name', `企业微信${capability}`);
+    serverArgs.push('--url', `https://qyapi.weixin.qq.com/mcp/v2/bot/${capability}?apikey=${shared}${'ta'.repeat(12)}${index}`);
+  });
+
+  const result = runCli(['--no-interactive', ...serverArgs, '--mode', 'light']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /内容编码：紧凑载荷 v4/);
+  assert.match(result.stdout, /二维码分片：1 张/);
+  assert.ok(!result.stdout.includes(shared), '紧凑载荷同样不得把完整 Key 打到终端');
+});
+
 test('--png 覆盖已存在的 0644 文件后权限也必须收紧为 600（含真实 API Key 的落盘边界）', () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'wecom-mcp-png-'));
   try {
@@ -170,16 +249,15 @@ test('--png 覆盖已存在的 0644 文件后权限也必须收紧为 600（含�
   }
 });
 
-test('32 个长中文名配置配合 --max-chars 2000 能成功按字节分片（P1 回归）', () => {
-  // 回归点：按字符数判断「够不够分片」而忽略二维码 2331 字节上限时，
-  // 中文配置会在渲染阶段报 QR_TOO_LARGE，用户拿不到可用二维码。
+test('长 key 配置配合 --max-chars 2000 能成功分片（P1 回归）', () => {
+  // 回归点：分片要同时满足「每片字符数」与二维码 2331 字节上限；参数变化时不能生成超容量二维码。
   const longName = '企业微信消息能力位配置名称说明文字补充内容占位扩展字段'.repeat(2);
+  const capabilities = CAPABILITIES.map((capability) => capability.id);
   const args = ['--no-interactive', '--mode', 'light', '--max-chars', '2000'];
-  for (let index = 0; index < 32; index += 1) {
-    const suffix = String(index).padStart(2, '0');
-    args.push('--name', `${longName.slice(0, 38)}${suffix}`);
-    args.push('--url', `https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=${'k'.repeat(12)}${suffix}`);
-  }
+  capabilities.forEach((capability, index) => {
+    args.push('--name', `${longName.slice(0, 38)}${String(index).padStart(2, '0')}`);
+    args.push('--url', `https://qyapi.weixin.qq.com/mcp/v2/bot/${capability}?apikey=${uniqueKey(index)}`);
+  });
 
   const result = runCli(args);
   assert.equal(result.status, 0, result.stderr);
@@ -271,10 +349,10 @@ test('同一物理目标经软链别名并发导出：后发进程明确失败�
   try {
     writeFileSync(path.join(realDir, 'other.png'), 'keep');
     const args = ['--no-interactive', '--mode', 'light', '--max-chars', '250'];
-    for (let index = 0; index < 4; index += 1) {
+    ['msg', 'doc', 'schedule', 'todo'].forEach((capability, index) => {
       args.push('--name', `企业微信消息能力位配置名称说明${index}`);
-      args.push('--url', `https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=${'k'.repeat(400)}${index}`);
-    }
+      args.push('--url', `https://qyapi.weixin.qq.com/mcp/v2/bot/${capability}?apikey=${uniqueKey(index)}`);
+    });
     const first = spawnCli([...args, '--png', path.join(realDir, 'qr.png')]);
     const lockName = await waitForLockFile(realDir);
     const lockText = readFileSync(path.join(realDir, lockName), 'utf8');
@@ -355,10 +433,10 @@ test('SIGTERM 终止导出时同步释放导出锁，不阻塞后续同目标导
   const dir = mkdtempSync(path.join(os.tmpdir(), 'wecom-mcp-sigterm-'));
   try {
     const args = ['--no-interactive', '--mode', 'light', '--max-chars', '250'];
-    for (let index = 0; index < 6; index += 1) {
+    ['msg', 'doc', 'schedule', 'todo', 'meeting', 'contact'].forEach((capability, index) => {
       args.push('--name', `企业微信消息能力位配置名称说明${index}`);
-      args.push('--url', `https://qyapi.weixin.qq.com/mcp/v2/bot/msg?apikey=${'k'.repeat(400)}${index}`);
-    }
+      args.push('--url', `https://qyapi.weixin.qq.com/mcp/v2/bot/${capability}?apikey=${uniqueKey(index)}`);
+    });
     const first = spawnCli([...args, '--png', path.join(dir, 'qr.png')]);
     await waitForLockFile(dir);
     first.child.kill('SIGTERM');
